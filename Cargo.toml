@@ -1,6 +1,6 @@
 [package]
 name = "eflips-schedule-rust"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -18,3 +18,8 @@ hopcroft-karp = "0.2.1"
 log = "0.4.22"
 tqdm = "0.7.0"
 rayon = "1.10.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
