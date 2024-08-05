@@ -20,9 +20,9 @@ fn rotation_plan(input_json: String, soc_aware: bool) -> PyResult<Vec<(TripId, T
     let result = if soc_aware {
         soc_aware_rotation_plan_vec(&json_file)
     } else {
-        rotation_plan_non_soc_aware_vec(&json_file) 
+        rotation_plan_non_soc_aware_vec(&json_file)
     };
-    
+
     Ok(result)
 }
 
@@ -417,7 +417,7 @@ fn soc_aware_rotation_plan(graph: &BusGraph) -> Vec<(TripId, TripId)> {
 /// Convenience method to calculate the SoC-aware rotation plan for a vector of graphs
 fn soc_aware_rotation_plan_vec(graphs: &Vec<BusGraph>) -> Vec<(TripId, TripId)> {
     let mut results: Vec<(TripId, TripId)> = Vec::new();
-    for graph in tqdm(graphs) {
+    for graph in graphs {
         let edged = soc_aware_rotation_plan(graph);
         for edge in edged {
             results.push(edge);
@@ -754,7 +754,7 @@ fn rotation_plan_non_soc_aware(bus_graph: &BusGraph) -> Vec<(TripId, TripId)> {
 /// Convenience method to calculate the non-SOC-aware rotation plan for a vector of graphs
 fn rotation_plan_non_soc_aware_vec(graphs: &Vec<BusGraph>) -> Vec<(TripId, TripId)> {
     let mut results: Vec<(TripId, TripId)> = Vec::new();
-    for graph in tqdm(graphs) {
+    for graph in graphs {
         let edged = rotation_plan_non_soc_aware(graph);
         for edge in edged {
             results.push(edge);

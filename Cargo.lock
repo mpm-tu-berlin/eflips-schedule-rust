@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "eflips-schedule-rust"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "hopcroft-karp",
  "log",
