@@ -1,16 +1,15 @@
-use pyo3::prelude::*;
+use log::{debug, info, trace, warn};
 use pathfinding::prelude::{kuhn_munkres_min, Matrix};
 use petgraph::prelude::StableGraph;
 use petgraph::stable_graph::{NodeIndex, StableDiGraph};
 use petgraph::visit::EdgeRef;
 use petgraph::{Directed, Graph, Undirected};
+use pyo3::prelude::*;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use log::{debug, info, warn};
 use tqdm::tqdm;
-
 
 #[pyfunction]
 fn rotation_plan(input_json: String, soc_aware: bool) -> PyResult<Vec<(TripId, TripId)>> {
@@ -32,8 +31,6 @@ fn eflips_schedule_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rotation_plan, m)?)?;
     Ok(())
 }
-
-
 
 pub type TripId = u64;
 pub type DeltaSocEffective = f32;
@@ -64,9 +61,8 @@ struct JsonGraph {
     edges: Vec<JsonEdge>,
 }
 
-
 #[derive(Clone, Debug)]
-struct BusGraph {
+pub struct BusGraph {
     graph: StableGraph<DeltaSocEffective, WaitTime, Directed>,
     node_id_trip_id: HashMap<NodeIndex, TripId>,
     trip_id_node_id: HashMap<TripId, NodeIndex>,
@@ -77,11 +73,22 @@ struct BusGraph {
 /// The JSON string should contain first a list of (node_id, weight (=delta_soc_effective)) pairs
 /// Then a list of (source, target, weight) triples
 fn read_graph_from_string(input: String) -> Vec<BusGraph> {
-    let json_file: Vec<JsonGraph> = serde_json::from_str(&input).expect("Error while reading JSON file");
+    let json_file: Vec<JsonGraph> =
+        serde_json::from_str(&input).expect("Error while reading JSON file");
 
     return json_graph_to_bus_graph(json_file);
 }
 
+/// Reads in the graph from a JSON input file
+/// The JSON string should contain first a list of (node_id, weight (=delta_soc_effective)) pairs
+/// Then a list of (source, target, weight) triples
+pub fn read_graph_from_file(input: &str) -> Vec<BusGraph> {
+    let file = std::fs::read_to_string(input).expect("Could not read file");
+    let json_file: Vec<JsonGraph> =
+        serde_json::from_str(&file).expect("Error while reading JSON file");
+
+    return json_graph_to_bus_graph(json_file);
+}
 
 /// Turns a Vec of JsonGraoh into a Voc of BusGraph
 fn json_graph_to_bus_graph(json_graphs: Vec<JsonGraph>) -> Vec<BusGraph> {
@@ -200,10 +207,7 @@ fn find_excessive_rotation(
     return None;
 }
 
-fn delta_soc_effective(
-    connected_set: &Vec<NodeIndex>,
-    bus_graph: &BusGraph,
-) -> DeltaSocEffective {
+fn _delta_soc_effective(connected_set: &Vec<NodeIndex>, bus_graph: &BusGraph) -> DeltaSocEffective {
     let mut soc = 0.0;
     for node in connected_set {
         soc += *bus_graph
@@ -214,7 +218,7 @@ fn delta_soc_effective(
     return soc;
 }
 
-fn max_energy_consumption(
+fn _max_energy_consumption(
     rotation_connections: &Vec<(TripId, TripId)>,
     bus_graph: &BusGraph,
 ) -> DeltaSocEffective {
@@ -223,7 +227,7 @@ fn max_energy_consumption(
 
     let mut max_delta_soc_effective = 0.0;
     for connected_set in connected_sets {
-        let delta_soc = delta_soc_effective(&connected_set, bus_graph);
+        let delta_soc = _delta_soc_effective(&connected_set, bus_graph);
         if delta_soc > max_delta_soc_effective {
             max_delta_soc_effective = delta_soc;
         }
@@ -298,9 +302,10 @@ fn cost_of_removal(
             total_rotation_count(&rotation_plan_after_removal_front, &bus_graph_copy);
         let excessive_rotations_after_removal_front =
             excessive_soc_rotations(&rotation_plan_after_removal_front, &bus_graph_copy).len();
-        let max_energy_consumption_after_removal_front =
-            max_energy_consumption(&rotation_plan_after_removal_front, &graph);
-        let weight_front = total_rotations_after_removal_front * 1000000000 + (max_energy_consumption_after_removal_front * 1000.0) as usize * 0 + excessive_rotations_after_removal_front * 1;
+        /*let max_energy_consumption_after_removal_front =
+        max_energy_consumption(&rotation_plan_after_removal_front, &graph);*/
+        let weight_front = total_rotations_after_removal_front * 1000000000
+            + excessive_rotations_after_removal_front * 1;
         weight_front
     };
 
@@ -317,18 +322,19 @@ fn cost_of_removal(
             total_rotation_count(&rotation_plan_after_removal_back, &bus_graph_copy);
         let excessive_rotations_after_removal_back =
             excessive_soc_rotations(&rotation_plan_after_removal_back, &bus_graph_copy).len();
-        let max_energy_consumption_after_removal_back =
-            max_energy_consumption(&rotation_plan_after_removal_back, &graph);
-        let weight_back = total_rotations_after_removal_back * 1000000000 + (max_energy_consumption_after_removal_back * 1000.0) as usize * 0 + excessive_rotations_after_removal_back * 1;
+        /*let max_energy_consumption_after_removal_back =
+        max_energy_consumption(&rotation_plan_after_removal_back, &graph);*/
+        let weight_back = total_rotations_after_removal_back * 1000000000
+            + excessive_rotations_after_removal_back * 1;
         weight_back
     };
 
     if weight_front < weight_back {
-        info!("Weight front: {}", weight_front);
+        trace!("Weight front: {}", weight_front);
         (nodes_to_remove_front, weight_front)
     } else {
-        info!("Weight back: {}", weight_front);
-        let reversed_nodes_to_remove_back= nodes_to_remove_back.iter().rev().cloned().collect();
+        trace!("Weight back: {}", weight_front);
+        let reversed_nodes_to_remove_back = nodes_to_remove_back.iter().rev().cloned().collect();
         (reversed_nodes_to_remove_back, weight_back)
     }
 }
@@ -337,7 +343,7 @@ fn cost_of_removal(
 const PARALLEL: bool = true;
 
 /// Solve the rotation plan problem in a SOC-aware way
-fn soc_aware_rotation_plan(graph: &BusGraph) -> Vec<(TripId, TripId)> {
+pub fn soc_aware_rotation_plan(graph: &BusGraph) -> Vec<(TripId, TripId)> {
     // Construct a non-soc-aware rotation plan
     let bipartite_graph = to_bipartite(&graph);
     let mut rotation_plan = maximum_matching(bipartite_graph);
@@ -352,6 +358,10 @@ fn soc_aware_rotation_plan(graph: &BusGraph) -> Vec<(TripId, TripId)> {
 
         let effects_of_removal = {
             if PARALLEL {
+                debug!(
+                    "Checking {} rotations in parallel",
+                    the_excessive_soc_rotations.len()
+                );
                 let effects_of_removal = the_excessive_soc_rotations
                     .into_par_iter()
                     .map(|rotation| cost_of_removal(&rotation, &working_graph, &graph))
@@ -361,7 +371,8 @@ fn soc_aware_rotation_plan(graph: &BusGraph) -> Vec<(TripId, TripId)> {
                 warn!("Not using parallel processing!");
                 let mut effects_of_removal: Vec<(Vec<NodeIndex>, usize)> = Vec::new();
                 for rotation in tqdm(&the_excessive_soc_rotations) {
-                    let (nodes_to_remove, effect) = cost_of_removal(&rotation, &working_graph, &graph);
+                    let (nodes_to_remove, effect) =
+                        cost_of_removal(&rotation, &working_graph, &graph);
                     effects_of_removal.push((nodes_to_remove, effect));
                 }
                 effects_of_removal
@@ -686,9 +697,8 @@ fn maximum_matching(graph: BipartiteGraph) -> Vec<(TripId, TripId)> {
                 // The hopcroft-karp algorithm finds *one* maximum matching, not necessarily the best
                 // one. However, by sorting the edges by their weight, we can get a good approximation
                 // of the best matching
-                edge_list.sort_unstable_by_key(|edge| {
-                    *wait_times.get(edge).expect("Edge not found!")
-                });
+                edge_list
+                    .sort_unstable_by_key(|edge| *wait_times.get(edge).expect("Edge not found!"));
 
                 // We were not able to find a matching that covers all top nodes
                 // We need to use the Hopcroft-Karp algorithm
@@ -743,7 +753,10 @@ fn maximum_matching(graph: BipartiteGraph) -> Vec<(TripId, TripId)> {
 fn rotation_plan_non_soc_aware(bus_graph: &BusGraph) -> Vec<(TripId, TripId)> {
     let bipartite_graph = to_bipartite(&bus_graph);
     let matching = maximum_matching(bipartite_graph);
-    info!("Total number of rotations: {}", total_rotation_count(&matching, &bus_graph));
+    info!(
+        "Total number of rotations: {}",
+        total_rotation_count(&matching, &bus_graph)
+    );
     info!(
         "Excessive SOC rotations: {:?}",
         excessive_soc_rotations(&matching, &bus_graph)
