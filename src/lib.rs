@@ -670,7 +670,7 @@ fn maximum_matching(graph: BipartiteGraph) -> Vec<(TripId, TripId)> {
             // doesn't actually have an edge in the graph. If that is the case, we'll have to
             // use hopcroft-karp instead.
             // Invaliud matchings are marked by a total wait time greater than i32::MAX
-            if total_wait_time > i32::MAX as i64 {
+            if total_wait_time >= i32::MAX as i64 {
                 // We need to find out if a matching that covers all of the column_nodes nodes is possible
                 // If yes, we can use the Hungarian Algorithm (Kuhn-Munkres) to find the best
                 // (lowest wait time) matching
