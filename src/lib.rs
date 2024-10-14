@@ -1,4 +1,4 @@
-use log::{debug, info, trace, warn};
+use log::{debug, trace, warn};
 use pathfinding::prelude::{kuhn_munkres_min, Matrix};
 use petgraph::prelude::StableGraph;
 use petgraph::stable_graph::{NodeIndex, StableDiGraph};
@@ -9,48 +9,49 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use tqdm::tqdm;
+const NODE_WEIGHT_LIMIT: f32 = 1.0;
+const NODE_WEIGHT_SIZE: usize = 2;
 
+pub type TripId = u64; //TODO: Check shrinking range to u32
+pub type SingleNodeWeight = f32;
+pub type NodeWeight = [SingleNodeWeight; NODE_WEIGHT_SIZE]; //TODO: Check int conversion
+pub type EdgeWeight = u16; //TODO: Check int conversion
+
+/// Solve the vehicle scheduling problem
+/// This is the entry point (and only exposed function) for the Python module
+/// It takes a JSON string as input and returns a list of (TripId, TripId) pairs
 #[pyfunction]
-fn rotation_plan(input_json: String, soc_aware: bool) -> PyResult<Vec<(TripId, TripId)>> {
-    // Read the input json
+pub fn solve(input_json: String) -> PyResult<Vec<(TripId, TripId)>> {
     let input_json = input_json.to_string();
     let json_file = read_graph_from_string(input_json);
-    let result = if soc_aware {
-        soc_aware_rotation_plan_vec(&json_file)
-    } else {
-        rotation_plan_non_soc_aware_vec(&json_file)
-    };
+    let result = soc_aware_rotation_plan_vec(&json_file);
 
     Ok(result)
 }
 
 /// A Python module implemented in Rust.
 #[pymodule]
-fn eflips_schedule_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(rotation_plan, m)?)?;
+pub fn eflips_schedule_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(solve, m)?)?;
     Ok(())
 }
 
-pub type TripId = u64;
-pub type DeltaSocEffective = f32;
-pub type WaitTime = u32;
-
-/// The list of nodes is the lowest llevel structure of the graph
+/// The list of nodes is an inner level structure of the graph
 /// The IDs are TripIds, the weights are delta_soc_effective values
 #[derive(Serialize, Deserialize)]
 struct JsonNode {
     id: TripId,
-    weight: DeltaSocEffective,
+    weight: [Option<SingleNodeWeight>; NODE_WEIGHT_SIZE],
 }
 
+/// The list of edges is an inner level structure of the graph
 /// An edge connects two nodes and has a weight
 /// The source and target are the TripIds of the nodes
 #[derive(Serialize, Deserialize)]
 struct JsonEdge {
     source: TripId,
     target: TripId,
-    weight: WaitTime,
+    weight: EdgeWeight,
 }
 
 /// The Json file is composed of the graph already split into a set of connected
@@ -61,22 +62,26 @@ struct JsonGraph {
     edges: Vec<JsonEdge>,
 }
 
+/// The BusGraph is the internal representation of the graph
+/// It contains the graph itself, as well as maps to convert between TripIds and NodeIndices
+/// Also, the topological order of the nodes is stored, so we don't need to recalculate it
+/// every time.
 #[derive(Clone, Debug)]
 pub struct BusGraph {
-    graph: StableGraph<DeltaSocEffective, WaitTime, Directed>,
+    graph: StableGraph<NodeWeight, EdgeWeight, Directed>,
     node_id_trip_id: HashMap<NodeIndex, TripId>,
     trip_id_node_id: HashMap<TripId, NodeIndex>,
     topo_order: HashMap<NodeIndex, usize>,
 }
 
 /// Reads in the graph from a JSON input string
-/// The JSON string should contain first a list of (node_id, weight (=delta_soc_effective)) pairs
+/// The JSON string should contain first a list of (node_id, weight(s)) pairs
 /// Then a list of (source, target, weight) triples
 fn read_graph_from_string(input: String) -> Vec<BusGraph> {
     let json_file: Vec<JsonGraph> =
         serde_json::from_str(&input).expect("Error while reading JSON file");
 
-    return json_graph_to_bus_graph(json_file);
+    json_graph_to_bus_graph(json_file)
 }
 
 /// Reads in the graph from a JSON input file
@@ -87,10 +92,10 @@ pub fn read_graph_from_file(input: &str) -> Vec<BusGraph> {
     let json_file: Vec<JsonGraph> =
         serde_json::from_str(&file).expect("Error while reading JSON file");
 
-    return json_graph_to_bus_graph(json_file);
+    json_graph_to_bus_graph(json_file)
 }
 
-/// Turns a Vec of JsonGraoh into a Voc of BusGraph
+/// Turns a Vec of JsonGraph into a Vec of BusGraph
 fn json_graph_to_bus_graph(json_graphs: Vec<JsonGraph>) -> Vec<BusGraph> {
     let mut all_graphs = Vec::new();
     for json_graph in json_graphs {
@@ -98,13 +103,17 @@ fn json_graph_to_bus_graph(json_graphs: Vec<JsonGraph>) -> Vec<BusGraph> {
         let mut trip_id_node_id: HashMap<TripId, NodeIndex> = HashMap::new();
         let mut graph = StableDiGraph::new();
         for node in json_graph.nodes {
-            let node_id = graph.add_node(node.weight as DeltaSocEffective);
+            // Turn the None values into 0.0
+            let mut weight = [0.0; NODE_WEIGHT_SIZE];
+            for (i, weight_value) in node.weight.iter().enumerate() {
+                weight[i] = weight_value.unwrap_or(0.0);
+            }
+
+            let node_id = graph.add_node(weight as NodeWeight);
             trip_id_node_id.insert(node.id as TripId, node_id);
         }
-        let node_id_trip_id: HashMap<NodeIndex, TripId> = trip_id_node_id
-            .iter()
-            .map(|(k, v)| (v.clone(), k.clone()))
-            .collect();
+        let node_id_trip_id: HashMap<NodeIndex, TripId> =
+            trip_id_node_id.iter().map(|(k, v)| (*v, *k)).collect();
 
         // Add edges
         for edge in json_graph.edges {
@@ -114,7 +123,7 @@ fn json_graph_to_bus_graph(json_graphs: Vec<JsonGraph>) -> Vec<BusGraph> {
             let target = trip_id_node_id
                 .get(&edge.target)
                 .expect("Target node not found");
-            graph.add_edge(*source, *target, edge.weight as WaitTime);
+            graph.add_edge(*source, *target, edge.weight as EdgeWeight);
         }
 
         // Calculate the topological order of the nodes
@@ -125,45 +134,36 @@ fn json_graph_to_bus_graph(json_graphs: Vec<JsonGraph>) -> Vec<BusGraph> {
         }
 
         all_graphs.push(BusGraph {
-            graph: graph,
-            node_id_trip_id: node_id_trip_id,
-            trip_id_node_id: trip_id_node_id,
-            topo_order: topo_order,
+            graph,
+            node_id_trip_id,
+            trip_id_node_id,
+            topo_order,
         });
     }
 
-    return all_graphs;
+    all_graphs
 }
 
 /// Calculate the total number of rotations
 /// This is the number of unbroken sequences of two trips
 /// that are matched to each other
 /// (domino style)
-fn total_rotation_count(
+pub fn total_rotation_count(
     rotation_connections: &Vec<(TripId, TripId)>,
     bus_graph: &BusGraph,
 ) -> usize {
     let working_graph = assemble_working_graph(rotation_connections, bus_graph);
     let connected_sets = petgraph::algo::kosaraju_scc(&working_graph);
-    return connected_sets.len();
+    connected_sets.len()
 }
 
-/// Conveninence method to calculate the total number of rotations in a vector of graphs
-fn _total_rotation_count_vec(
-    rotation_connections: &Vec<Vec<(TripId, TripId)>>,
-    bus_graph: &BusGraph,
-) -> usize {
-    let mut total_rotations = 0;
-    for rotation in rotation_connections {
-        total_rotations += total_rotation_count(rotation, bus_graph);
-    }
-    return total_rotations;
-}
-
+/// Create a new working graph that has edges between all nodes from the rotation connections input
+/// from the original graph.
+/// This is a precondition to calculating the sum of weights of the nodes in a connected set
 fn assemble_working_graph(
     rotation_connections: &Vec<(TripId, TripId)>,
     bus_graph: &BusGraph,
-) -> StableGraph<DeltaSocEffective, WaitTime> {
+) -> StableGraph<NodeWeight, EdgeWeight> {
     let mut working_graph = bus_graph.graph.clone();
     working_graph.retain_edges(|_, _edge| false);
     for rotation_connection in rotation_connections {
@@ -179,21 +179,25 @@ fn assemble_working_graph(
         working_graph.add_edge(node2, node1, 0);
     }
 
-    return working_graph;
+    working_graph
 }
 
-fn find_excessive_rotation(
+/// Find which nodes in a connected set of nodes are exceeding limits of node weight sum
+fn find_excessive_nodes_for_rotation(
     connected_set: &Vec<NodeIndex>,
     bus_graph: &BusGraph,
 ) -> Option<Vec<NodeIndex>> {
-    let mut soc = 0.0;
+    let mut weight_sums: NodeWeight = [0.0; NODE_WEIGHT_SIZE];
     for node in connected_set {
-        soc += *bus_graph
+        let cur_trip_weight = *bus_graph
             .graph
             .node_weight(*node)
             .expect("Node has no weight!");
+        for i in 0..NODE_WEIGHT_SIZE {
+            weight_sums[i] += cur_trip_weight[i];
+        }
 
-        if soc > 1.0 {
+        if weight_sums.into_iter().any(|x| x > NODE_WEIGHT_LIMIT) {
             let mut ret_val = connected_set.clone();
             ret_val.sort_unstable_by_key(|node| {
                 *bus_graph
@@ -204,40 +208,47 @@ fn find_excessive_rotation(
             return Some(ret_val);
         }
     }
-    return None;
+    None
 }
 
-fn _delta_soc_effective(connected_set: &Vec<NodeIndex>, bus_graph: &BusGraph) -> DeltaSocEffective {
-    let mut soc = 0.0;
+/// Calculate the sum of weights of the nodes in a connected set
+fn node_weight_sum(connected_set: &Vec<NodeIndex>, bus_graph: &BusGraph) -> NodeWeight {
+    let mut weight_sums: NodeWeight = [0.0; NODE_WEIGHT_SIZE];
     for node in connected_set {
-        soc += *bus_graph
+        let cur_trip_weight = *bus_graph
             .graph
             .node_weight(*node)
             .expect("Node has no weight!");
+        for i in 0..NODE_WEIGHT_SIZE {
+            weight_sums[i] += cur_trip_weight[i];
+        }
     }
-    return soc;
+    weight_sums
 }
 
-fn _max_energy_consumption(
+/// Find the highest sum of weights of the nodes in a connected set
+fn max_weight_rotation(
     rotation_connections: &Vec<(TripId, TripId)>,
     bus_graph: &BusGraph,
-) -> DeltaSocEffective {
+) -> NodeWeight {
     let working_graph = assemble_working_graph(rotation_connections, bus_graph);
     let connected_sets = petgraph::algo::kosaraju_scc(&working_graph);
 
-    let mut max_delta_soc_effective = 0.0;
+    let mut max_weight_so_far: NodeWeight = [0.0; NODE_WEIGHT_SIZE];
     for connected_set in connected_sets {
-        let delta_soc = _delta_soc_effective(&connected_set, bus_graph);
-        if delta_soc > max_delta_soc_effective {
-            max_delta_soc_effective = delta_soc;
+        let weight_sum_of_set = node_weight_sum(&connected_set, bus_graph);
+        for i in 0..NODE_WEIGHT_SIZE {
+            if weight_sum_of_set[i] > max_weight_so_far[i] {
+                max_weight_so_far[i] = weight_sum_of_set[i];
+            }
         }
     }
-    return max_delta_soc_effective;
+    max_weight_so_far
 }
 
 /// Find the node lists of the rotations with delta_soc_effective > 1
 /// The node lists will be returned in topological order
-fn excessive_soc_rotations(
+fn excessive_rotations(
     rotation_connections: &Vec<(TripId, TripId)>,
     bus_graph: &BusGraph,
 ) -> Vec<Vec<NodeIndex>> {
@@ -246,47 +257,60 @@ fn excessive_soc_rotations(
     let connected_sets = petgraph::algo::kosaraju_scc(&working_graph);
     let mut excessive_soc_rotations: Vec<Vec<NodeIndex>> = Vec::new();
     for connected_set in connected_sets {
-        let excessive_rotation = find_excessive_rotation(&connected_set, bus_graph);
-        match excessive_rotation {
-            Some(rotation) => excessive_soc_rotations.push(rotation),
-            None => (),
+        let excessive_rotation = find_excessive_nodes_for_rotation(&connected_set, bus_graph);
+        if let Some(rotation) = excessive_rotation {
+            excessive_soc_rotations.push(rotation)
         }
     }
-    return excessive_soc_rotations;
+    excessive_soc_rotations
 }
 
 /// Take a list of nodes of a rotation that has excessive SOC
-/// amd return the amount of it from the start up to the last one that
+/// and return the amount of it from the start up to the last one that
 fn nodes_to_remove_forward(rotation: &Vec<NodeIndex>, bus_graph: &BusGraph) -> Vec<NodeIndex> {
     let mut nodes_to_keep: Vec<NodeIndex> = Vec::new();
-    let mut soc = 0.0;
+    let mut weight_sums: NodeWeight = [0.0; NODE_WEIGHT_SIZE];
     for node in rotation {
-        let delta_soc = *bus_graph
+        let cur_trip_weight = *bus_graph
             .graph
             .node_weight(*node)
             .expect("Node has no weight!");
-        if (soc + delta_soc) > 1.0 {
+        if weight_sums.into_iter().any(|x| x > NODE_WEIGHT_LIMIT) {
             break;
         }
         nodes_to_keep.push(*node);
-        soc += delta_soc;
+        for i in 0..NODE_WEIGHT_SIZE {
+            weight_sums[i] += cur_trip_weight[i];
+        }
     }
-    return nodes_to_keep;
+    nodes_to_keep
 }
 
 /// Take a list of nodes of a rotation that has excessive SOC
 /// amd return the amount of it from the end up to the last one that
 /// has a delta_soc_effective <= 1
-fn nodes_to_remove_backward(rotation: &Vec<NodeIndex>, bus_graph: &BusGraph) -> Vec<NodeIndex> {
+fn nodes_to_remove_backward(rotation: &[NodeIndex], bus_graph: &BusGraph) -> Vec<NodeIndex> {
     nodes_to_remove_forward(&rotation.iter().rev().cloned().collect(), bus_graph)
 }
 
+/// Calculate the cost of removing a set of nodes from the graph. THis is evaluated for all
+/// candidate rotations that have excessive SOC. Then the one with the smallest cost is removed.
 fn cost_of_removal(
     rotation: &Vec<NodeIndex>,
     working_graph: &BusGraph,
     graph: &BusGraph,
 ) -> (Vec<NodeIndex>, usize) {
-    let nodes_to_remove_front = nodes_to_remove_forward(&rotation, &graph);
+    /// The weight we give to the total number of rotations
+    const TOTAL_ROTATIONS_WEIGHT: usize = 1e9 as usize;
+
+    /// The weight we give to the weight of the rotation with the highest weight
+    const MAX_WEIGHT_WEIGHT: usize = 0;
+
+    /// The weight we give to the number of excessive rotations
+    /// This is a tiebreaker in case the total number of rotations is the same
+    const EXCESSIVE_ROTATIONS_WEIGHT: usize = 1;
+
+    let nodes_to_remove_front = nodes_to_remove_forward(rotation, graph);
     let weight_front = {
         // Remove the nodes from a copy of the graph
         let mut bus_graph_copy = working_graph.clone();
@@ -301,15 +325,18 @@ fn cost_of_removal(
         let total_rotations_after_removal_front =
             total_rotation_count(&rotation_plan_after_removal_front, &bus_graph_copy);
         let excessive_rotations_after_removal_front =
-            excessive_soc_rotations(&rotation_plan_after_removal_front, &bus_graph_copy).len();
-        /*let max_energy_consumption_after_removal_front =
-        max_energy_consumption(&rotation_plan_after_removal_front, &graph);*/
-        let weight_front = total_rotations_after_removal_front * 1000000000
-            + excessive_rotations_after_removal_front * 1;
-        weight_front
+            excessive_rotations(&rotation_plan_after_removal_front, &bus_graph_copy).len();
+        let max_weight_after_removal_front =
+            max_weight_rotation(&rotation_plan_after_removal_front, &bus_graph_copy)
+                .into_iter()
+                .max_by(|a, b| a.partial_cmp(b).unwrap())
+                .unwrap() as usize;
+        total_rotations_after_removal_front * TOTAL_ROTATIONS_WEIGHT
+            + max_weight_after_removal_front * MAX_WEIGHT_WEIGHT
+            + excessive_rotations_after_removal_front * EXCESSIVE_ROTATIONS_WEIGHT
     };
 
-    let nodes_to_remove_back = nodes_to_remove_backward(&rotation, &graph);
+    let nodes_to_remove_back = nodes_to_remove_backward(rotation, graph);
     let weight_back = {
         // Remove the nodes from a copy of the graph
         let mut bus_graph_copy = working_graph.clone();
@@ -321,12 +348,15 @@ fn cost_of_removal(
         let total_rotations_after_removal_back =
             total_rotation_count(&rotation_plan_after_removal_back, &bus_graph_copy);
         let excessive_rotations_after_removal_back =
-            excessive_soc_rotations(&rotation_plan_after_removal_back, &bus_graph_copy).len();
-        /*let max_energy_consumption_after_removal_back =
-        max_energy_consumption(&rotation_plan_after_removal_back, &graph);*/
-        let weight_back = total_rotations_after_removal_back * 1000000000
-            + excessive_rotations_after_removal_back * 1;
-        weight_back
+            excessive_rotations(&rotation_plan_after_removal_back, &bus_graph_copy).len();
+        let max_weight_after_removal_back =
+            max_weight_rotation(&rotation_plan_after_removal_back, &bus_graph_copy)
+                .into_iter()
+                .max_by(|a, b| a.partial_cmp(b).unwrap())
+                .unwrap() as usize;
+        total_rotations_after_removal_back * TOTAL_ROTATIONS_WEIGHT
+            + max_weight_after_removal_back * MAX_WEIGHT_WEIGHT
+            + excessive_rotations_after_removal_back * EXCESSIVE_ROTATIONS_WEIGHT
     };
 
     if weight_front < weight_back {
@@ -339,20 +369,20 @@ fn cost_of_removal(
     }
 }
 
-//Whether to use rayon for parallel processing
-const PARALLEL: bool = true;
-
 /// Solve the rotation plan problem in a SOC-aware way
 pub fn soc_aware_rotation_plan(graph: &BusGraph) -> Vec<(TripId, TripId)> {
+    ///Whether to use rayon for parallel processing
+    const PARALLEL: bool = true; //TODO
+
     // Construct a non-soc-aware rotation plan
-    let bipartite_graph = to_bipartite(&graph);
+    let bipartite_graph = to_bipartite(graph);
     let mut rotation_plan = maximum_matching(bipartite_graph);
 
     let mut rotations_removed: Vec<Vec<NodeIndex>> = Vec::new();
     let mut working_graph = graph.clone();
     loop {
-        let the_excessive_soc_rotations = excessive_soc_rotations(&rotation_plan, &working_graph);
-        if the_excessive_soc_rotations.len() == 0 {
+        let the_excessive_soc_rotations = excessive_rotations(&rotation_plan, &working_graph);
+        if the_excessive_soc_rotations.is_empty() {
             break;
         }
 
@@ -362,17 +392,16 @@ pub fn soc_aware_rotation_plan(graph: &BusGraph) -> Vec<(TripId, TripId)> {
                     "Checking {} rotations in parallel",
                     the_excessive_soc_rotations.len()
                 );
-                let effects_of_removal = the_excessive_soc_rotations
+                the_excessive_soc_rotations
                     .into_par_iter()
-                    .map(|rotation| cost_of_removal(&rotation, &working_graph, &graph))
-                    .collect::<Vec<(Vec<NodeIndex>, usize)>>();
-                effects_of_removal
+                    .map(|rotation| cost_of_removal(&rotation, &working_graph, graph))
+                    .collect::<Vec<(Vec<NodeIndex>, usize)>>()
             } else {
                 warn!("Not using parallel processing!");
                 let mut effects_of_removal: Vec<(Vec<NodeIndex>, usize)> = Vec::new();
-                for rotation in tqdm(&the_excessive_soc_rotations) {
+                for rotation in &the_excessive_soc_rotations {
                     let (nodes_to_remove, effect) =
-                        cost_of_removal(&rotation, &working_graph, &graph);
+                        cost_of_removal(rotation, &working_graph, graph);
                     effects_of_removal.push((nodes_to_remove, effect));
                 }
                 effects_of_removal
@@ -422,7 +451,7 @@ pub fn soc_aware_rotation_plan(graph: &BusGraph) -> Vec<(TripId, TripId)> {
         }
     }
 
-    return rotation_plan;
+    rotation_plan
 }
 
 /// Convenience method to calculate the SoC-aware rotation plan for a vector of graphs
@@ -434,11 +463,11 @@ fn soc_aware_rotation_plan_vec(graphs: &Vec<BusGraph>) -> Vec<(TripId, TripId)> 
             results.push(edge);
         }
     }
-    return results;
+    results
 }
 
 pub struct BipartiteGraph {
-    graph: Graph<String, WaitTime, Undirected>,
+    graph: Graph<String, EdgeWeight, Undirected>,
     top_node_id_trip_id: HashMap<NodeIndex, TripId>,
     bottom_node_id_trip_id: HashMap<NodeIndex, TripId>,
 }
@@ -447,7 +476,7 @@ pub struct BipartiteGraph {
 /// Where one set of  nodes only has outgoing edges and the other only incoming edges
 /// On this graph we can then solve the maximum matching problem
 fn to_bipartite(graph: &BusGraph) -> BipartiteGraph {
-    let mut bipartite_graph: Graph<String, WaitTime, Undirected> = Graph::new_undirected();
+    let mut bipartite_graph: Graph<String, EdgeWeight, Undirected> = Graph::new_undirected();
 
     // Add nodes to the bipartite graph
     let mut top_node_id_bipartite_node_id: HashMap<NodeIndex, NodeIndex> = HashMap::new();
@@ -499,16 +528,15 @@ fn to_bipartite(graph: &BusGraph) -> BipartiteGraph {
         );
     }
 
-    return {
-        BipartiteGraph {
-            graph: bipartite_graph,
-            top_node_id_trip_id: top_node_id_trip_id,
-            bottom_node_id_trip_id: bottom_node_id_trip_id,
-        }
-    };
+    BipartiteGraph {
+        graph: bipartite_graph,
+        top_node_id_trip_id,
+        bottom_node_id_trip_id,
+    }
 }
 
-fn _write_debug_dotfile(graph: &BipartiteGraph, connected_set: &Vec<NodeIndex>) {
+#[allow(dead_code)]
+fn write_debug_dotfile(graph: &BipartiteGraph, connected_set: &Vec<NodeIndex>) {
     // Remove all nodes from the trip graph that are not in the connected set
     let mut dump_graph = graph.graph.clone();
     let mut nodes_to_remove: Vec<NodeIndex> = Vec::new();
@@ -519,7 +547,7 @@ fn _write_debug_dotfile(graph: &BipartiteGraph, connected_set: &Vec<NodeIndex>) 
     }
 
     // Order the list highest to lowest
-    nodes_to_remove.sort_by(|a, b| b.index().cmp(&a.index()));
+    nodes_to_remove.sort_by_key(|b| std::cmp::Reverse(b.index()));
 
     for node in nodes_to_remove {
         dump_graph.remove_node(node);
@@ -543,6 +571,8 @@ fn _write_debug_dotfile(graph: &BipartiteGraph, connected_set: &Vec<NodeIndex>) 
 
 /// Solve the maximum matching problem on the bipartite graph
 /// Try using the Hungarian algorithm where possible
+/// If the Hungarian algorithm fails, use the Hopcroft-Karp algorithm
+/// **In the furture, this could be replaced with the blossom algorithm**
 fn maximum_matching(graph: BipartiteGraph) -> Vec<(TripId, TripId)> {
     // First, we divide the graph into its connected sets
     let connected_sets = petgraph::algo::kosaraju_scc(&graph.graph);
@@ -580,7 +610,7 @@ fn maximum_matching(graph: BipartiteGraph) -> Vec<(TripId, TripId)> {
             let mut top_nodes: Vec<NodeIndex> = Vec::new();
             let mut bottom_nodes: Vec<NodeIndex> = Vec::new();
             for node in &connected_set {
-                if graph.top_node_id_trip_id.contains_key(&node) {
+                if graph.top_node_id_trip_id.contains_key(node) {
                     top_nodes.push(*node);
                 } else {
                     bottom_nodes.push(*node);
@@ -604,7 +634,7 @@ fn maximum_matching(graph: BipartiteGraph) -> Vec<(TripId, TripId)> {
                             *node,
                             *graph
                                 .top_node_id_trip_id
-                                .get(&node)
+                                .get(node)
                                 .expect("Node not found!"),
                         );
                     }
@@ -613,7 +643,7 @@ fn maximum_matching(graph: BipartiteGraph) -> Vec<(TripId, TripId)> {
                             *node,
                             *graph
                                 .bottom_node_id_trip_id
-                                .get(&node)
+                                .get(node)
                                 .expect("Node not found!"),
                         );
                     }
@@ -628,7 +658,7 @@ fn maximum_matching(graph: BipartiteGraph) -> Vec<(TripId, TripId)> {
                             *node,
                             *graph
                                 .top_node_id_trip_id
-                                .get(&node)
+                                .get(node)
                                 .expect("Node not found!"),
                         );
                     }
@@ -637,7 +667,7 @@ fn maximum_matching(graph: BipartiteGraph) -> Vec<(TripId, TripId)> {
                             *node,
                             *graph
                                 .bottom_node_id_trip_id
-                                .get(&node)
+                                .get(node)
                                 .expect("Node not found!"),
                         );
                     }
@@ -746,37 +776,83 @@ fn maximum_matching(graph: BipartiteGraph) -> Vec<(TripId, TripId)> {
             }
         }
     }
-    return matching;
+    matching
 }
 
-/// Solve the maximum matching problem on a vector of bus graphs
-fn rotation_plan_non_soc_aware(bus_graph: &BusGraph) -> Vec<(TripId, TripId)> {
-    let bipartite_graph = to_bipartite(&bus_graph);
-    let matching = maximum_matching(bipartite_graph);
-    info!(
-        "Total number of rotations: {}",
-        total_rotation_count(&matching, &bus_graph)
-    );
-    info!(
-        "Excessive SOC rotations: {:?}",
-        excessive_soc_rotations(&matching, &bus_graph)
-    );
-    return matching;
-}
-
-/// Convenience method to calculate the non-SOC-aware rotation plan for a vector of graphs
-fn rotation_plan_non_soc_aware_vec(graphs: &Vec<BusGraph>) -> Vec<(TripId, TripId)> {
-    let mut results: Vec<(TripId, TripId)> = Vec::new();
-    for graph in graphs {
-        let edged = rotation_plan_non_soc_aware(graph);
-        for edge in edged {
-            results.push(edge);
-        }
-    }
-    return results;
-}
-
-fn _edges_to_json(edges: Vec<(TripId, TripId)>, filename: String) {
+/// Write the matching to a JSON file. This is useful for debugging
+#[allow(dead_code)]
+fn edges_to_json(edges: Vec<(TripId, TripId)>, filename: String) {
     let json = serde_json::to_string(&edges).expect("Could not serialize matching to JSON");
     std::fs::write(filename, json).expect("Could not write JSON to file");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NO_NODE_WEIGHT_PATH: &str = "test/no_node_weights.json";
+    const ONE_NODE_WEIGHT_PATH: &str = "test/one_node_weight.json";
+    const BOTH_NODE_WEIGHTS_PATH: &str = "test/both_node_weights.json";
+
+    #[test]
+    fn test_read_graph_from_string() {
+        // We read the file into a string, then test the function
+        let input_str = std::fs::read_to_string(NO_NODE_WEIGHT_PATH).expect("Could not read file");
+        let graphs: Vec<BusGraph> = read_graph_from_string(input_str);
+        assert_eq!(graphs.len(), 12);
+    }
+
+    #[test]
+    fn test_read_graph_from_file() {
+        let graphs: Vec<BusGraph> = read_graph_from_file(NO_NODE_WEIGHT_PATH);
+        assert_eq!(graphs.len(), 12);
+    }
+
+    #[test]
+    fn test_total_rotation_count() {
+        let graphs: Vec<BusGraph> = read_graph_from_file(NO_NODE_WEIGHT_PATH);
+        let trip_ids = soc_aware_rotation_plan(&graphs[0]);
+        let count = total_rotation_count(&trip_ids, &graphs[0]);
+        assert_eq!(count, 62);
+    }
+
+    #[test]
+    fn test_schedule_no_node_weight() {
+        let graphs: Vec<BusGraph> = read_graph_from_file(NO_NODE_WEIGHT_PATH);
+
+        let mut number_of_schedules = Vec::new();
+
+        for graph in &graphs {
+            let trip_ids = soc_aware_rotation_plan(graph);
+            let count = total_rotation_count(&trip_ids, graph);
+            number_of_schedules.push(count);
+        }
+
+        let number_of_edges = [62, 20, 5, 3, 3, 2, 2, 1, 1, 1, 1, 1];
+        assert_eq!(number_of_schedules, Vec::from(&number_of_edges[..]));
+    }
+
+    #[test]
+    fn test_schedule_one_node_weight() {
+        let graphs: Vec<BusGraph> = read_graph_from_file(ONE_NODE_WEIGHT_PATH);
+        let trip_ids = soc_aware_rotation_plan(&graphs[0]);
+        let count = total_rotation_count(&trip_ids, &graphs[0]);
+        assert_eq!(count, 220);
+    }
+
+    #[test]
+    fn test_schedule_both_node_weights() {
+        let graphs: Vec<BusGraph> = read_graph_from_file(BOTH_NODE_WEIGHTS_PATH);
+
+        let mut number_of_schedules = Vec::new();
+
+        for graph in &graphs {
+            let trip_ids = soc_aware_rotation_plan(graph);
+            let count = total_rotation_count(&trip_ids, graph);
+            number_of_schedules.push(count);
+        }
+
+        let number_of_edges = [222, 82, 20, 12, 12, 10, 5, 3, 1, 1, 1, 1];
+        assert_eq!(number_of_schedules, number_of_edges);
+    }
 }

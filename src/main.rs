@@ -1,21 +1,17 @@
-use crate::lib::read_graph_from_file;
 use crate::lib::soc_aware_rotation_plan;
+use crate::lib::{read_graph_from_file, total_rotation_count, BusGraph};
 
 mod lib;
 
-const INPUT_FILE: &str = "graph_red.json";
 fn main() {
     env_logger::init();
 
-    let bus_graph = read_graph_from_file(INPUT_FILE);
-    if bus_graph.len() != 1 {
-        panic!("Expected exactly one graph in the input file");
-    }
-    let single_graph = &bus_graph[0];
+    const NO_NODE_WEIGHT_PATH: &str = "test/no_node_weights.json";
+    const ONE_NODE_WEIGHT_PATH: &str = "test/one_node_weight.json";
+    const BOTH_NODE_WEIGHTS_PATH: &str = "test/both_node_weights.json";
 
-    let edges = soc_aware_rotation_plan(single_graph);
-    // Write to a JSON
-    let output_file = "graph_out.json";
-    let output = std::fs::File::create(output_file).unwrap();
-    serde_json::to_writer(&output, &edges).unwrap();
+    let graphs: Vec<BusGraph> = read_graph_from_file(NO_NODE_WEIGHT_PATH);
+    let trip_ids = soc_aware_rotation_plan(&graphs[0]);
+    let count = total_rotation_count(&trip_ids, &graphs[0]);
+    assert_eq!(count, 62);
 }

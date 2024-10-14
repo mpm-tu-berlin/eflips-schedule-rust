@@ -4,6 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "eflips-schedule-rust"
+description = "Vehicle Scheduling in Rust for eFLIPS."
 requires-python = ">=3.8"
 classifiers = [
     "Programming Language :: Rust",
@@ -11,5 +12,15 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dynamic = ["version"]
+authors = [
+  {name = "Ludger Heide", email = "ludger.heide@tu-berlin.de"},
+]
+readme = "README.md"
+license = "AGPLV3.md"
+
+
+[project.urls]
+Repository = "https://github.com/mpm-tu-berlin/eflips-schedule-rust"
+
 [tool.maturin]
 features = ["pyo3/extension-module"]
