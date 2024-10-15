@@ -9,13 +9,13 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-const NODE_WEIGHT_LIMIT: f32 = 1.0;
+const NODE_WEIGHT_LIMIT: SingleNodeWeight = 1.0;
 const NODE_WEIGHT_SIZE: usize = 2;
 
-pub type TripId = u64; //TODO: Check shrinking range to u32
+pub type TripId = u64;
 pub type SingleNodeWeight = f32;
-pub type NodeWeight = [SingleNodeWeight; NODE_WEIGHT_SIZE]; //TODO: Check int conversion
-pub type EdgeWeight = u16; //TODO: Check int conversion
+pub type NodeWeight = [SingleNodeWeight; NODE_WEIGHT_SIZE];
+pub type EdgeWeight = u64;
 
 /// Solve the vehicle scheduling problem
 /// This is the entry point (and only exposed function) for the Python module
@@ -372,7 +372,7 @@ fn cost_of_removal(
 /// Solve the rotation plan problem in a SOC-aware way
 pub fn soc_aware_rotation_plan(graph: &BusGraph) -> Vec<(TripId, TripId)> {
     ///Whether to use rayon for parallel processing
-    const PARALLEL: bool = true; //TODO
+    const PARALLEL: bool = true;
 
     // Construct a non-soc-aware rotation plan
     let bipartite_graph = to_bipartite(graph);
