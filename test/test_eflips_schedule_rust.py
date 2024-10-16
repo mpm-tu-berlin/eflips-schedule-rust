@@ -58,7 +58,7 @@ class TheTestCase(unittest.TestCase):
 
         # Print the number of connected components
         self.assertEqual(
-            number_of_schedules, [222, 82, 20, 12, 12, 10, 5, 3, 1, 1, 1, 1]
+            number_of_schedules, [268, 103, 21, 12, 12, 14, 5, 4, 1, 1, 1, 1]
         )
 
 

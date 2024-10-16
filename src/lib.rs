@@ -275,13 +275,20 @@ fn nodes_to_remove_forward(rotation: &Vec<NodeIndex>, bus_graph: &BusGraph) -> V
             .graph
             .node_weight(*node)
             .expect("Node has no weight!");
-        if weight_sums.into_iter().any(|x| x > NODE_WEIGHT_LIMIT) {
-            break;
-        }
-        nodes_to_keep.push(*node);
+
+        // Add the weight of the current node to the weight sum
         for i in 0..NODE_WEIGHT_SIZE {
             weight_sums[i] += cur_trip_weight[i];
         }
+
+        // If any of the weight sums exceed the limit, we stop
+        // So far, we have added nodes to keep, up to the node before the one that exceeded the limit
+        if weight_sums.into_iter().any(|x| x > NODE_WEIGHT_LIMIT) {
+            break;
+        }
+
+        // If the weight sum is still below the limit, we add the node to the list of nodes to keep
+        nodes_to_keep.push(*node);
     }
     nodes_to_keep
 }
@@ -794,6 +801,21 @@ mod tests {
     const ONE_NODE_WEIGHT_PATH: &str = "test/one_node_weight.json";
     const BOTH_NODE_WEIGHTS_PATH: &str = "test/both_node_weights.json";
 
+    /// Takes a solution (as a list of (TripId, TripId) pairs) as swell as the graph this is
+    /// placed on, and checks if the sum of the node weights of the nodes in the connected set
+    /// is below the limit
+    /// Panics if the sum of the node weights is above the limit
+    fn validate_sum_of_node_weights(solution: &Vec<(TripId, TripId)>, graph: &BusGraph) {
+        let working_graph = assemble_working_graph(solution, graph);
+        let connected_sets = petgraph::algo::kosaraju_scc(&working_graph);
+        for connected_set in connected_sets {
+            let weight_sum = node_weight_sum(&connected_set, graph);
+            if weight_sum.into_iter().any(|x| x > NODE_WEIGHT_LIMIT) {
+                panic!("Node weight sum exceeded limit!");
+            }
+        }
+    }
+
     #[test]
     fn test_read_graph_from_string() {
         // We read the file into a string, then test the function
@@ -824,6 +846,9 @@ mod tests {
 
         for graph in &graphs {
             let trip_ids = soc_aware_rotation_plan(graph);
+
+            validate_sum_of_node_weights(&trip_ids, graph);
+
             let count = total_rotation_count(&trip_ids, graph);
             number_of_schedules.push(count);
         }
@@ -836,8 +861,11 @@ mod tests {
     fn test_schedule_one_node_weight() {
         let graphs: Vec<BusGraph> = read_graph_from_file(ONE_NODE_WEIGHT_PATH);
         let trip_ids = soc_aware_rotation_plan(&graphs[0]);
+
+        validate_sum_of_node_weights(&trip_ids, &graphs[0]);
+
         let count = total_rotation_count(&trip_ids, &graphs[0]);
-        assert_eq!(count, 220);
+        assert_eq!(count, 270);
     }
 
     #[test]
@@ -848,11 +876,14 @@ mod tests {
 
         for graph in &graphs {
             let trip_ids = soc_aware_rotation_plan(graph);
+
+            validate_sum_of_node_weights(&trip_ids, graph);
+
             let count = total_rotation_count(&trip_ids, graph);
             number_of_schedules.push(count);
         }
 
-        let number_of_edges = [222, 82, 20, 12, 12, 10, 5, 3, 1, 1, 1, 1];
+        let number_of_edges = [268, 103, 21, 12, 12, 14, 5, 4, 1, 1, 1, 1];
         assert_eq!(number_of_schedules, number_of_edges);
     }
 }
