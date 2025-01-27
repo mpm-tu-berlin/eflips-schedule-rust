@@ -797,20 +797,30 @@ fn edges_to_json(edges: Vec<(TripId, TripId)>, filename: String) {
 mod tests {
     use super::*;
 
-    const NO_NODE_WEIGHT_PATH: &str = "test/no_node_weights.json";
-    const ONE_NODE_WEIGHT_PATH: &str = "test/one_node_weight.json";
-    const BOTH_NODE_WEIGHTS_PATH: &str = "test/both_node_weights.json";
+    const NO_NODE_WEIGHT_PATH_IN: &str = "test/no_node_weights.json";
+    const NO_NODE_WEIGHT_PATH_OUT: &str = "test/no_node_weights_matching.json";
+
+    const ONE_NODE_WEIGHT_PATH_IN: &str = "test/one_node_weight.json";
+    const ONE_NODE_WEIGHT_PATH_OUT: &str = "test/one_node_weight_matching.json";
+
+    const BOTH_NODE_WEIGHTS_PATH_IN: &str = "test/both_node_weights.json";
+    const BOTH_NODE_WEIGHTS_PATH_OUT: &str = "test/both_node_weights_matching.json";
+
+
+    const ARCH_DEPENDENT_RESULT_PATH_IN: &str = "test/arch_dependent_result.json";
+    const ARCH_DEPENDENT_RESULT_PATH_OUT: &str = "test/arch_dependent_result_matching.json";
 
     /// Takes a solution (as a list of (TripId, TripId) pairs) as swell as the graph this is
     /// placed on, and checks if the sum of the node weights of the nodes in the connected set
     /// is below the limit
     /// Panics if the sum of the node weights is above the limit
+    /// Uses an epsilon of 1e-6 to account for floating point errors
     fn validate_sum_of_node_weights(solution: &Vec<(TripId, TripId)>, graph: &BusGraph) {
         let working_graph = assemble_working_graph(solution, graph);
         let connected_sets = petgraph::algo::kosaraju_scc(&working_graph);
         for connected_set in connected_sets {
             let weight_sum = node_weight_sum(&connected_set, graph);
-            if weight_sum.into_iter().any(|x| x > NODE_WEIGHT_LIMIT) {
+            if weight_sum.into_iter().any(|x| x - NODE_WEIGHT_LIMIT > 1e-6) {
                 panic!("Node weight sum exceeded limit!");
             }
         }
@@ -819,20 +829,20 @@ mod tests {
     #[test]
     fn test_read_graph_from_string() {
         // We read the file into a string, then test the function
-        let input_str = std::fs::read_to_string(NO_NODE_WEIGHT_PATH).expect("Could not read file");
+        let input_str = std::fs::read_to_string(NO_NODE_WEIGHT_PATH_IN).expect("Could not read file");
         let graphs: Vec<BusGraph> = read_graph_from_string(input_str);
         assert_eq!(graphs.len(), 12);
     }
 
     #[test]
     fn test_read_graph_from_file() {
-        let graphs: Vec<BusGraph> = read_graph_from_file(NO_NODE_WEIGHT_PATH);
+        let graphs: Vec<BusGraph> = read_graph_from_file(NO_NODE_WEIGHT_PATH_IN);
         assert_eq!(graphs.len(), 12);
     }
 
     #[test]
     fn test_total_rotation_count() {
-        let graphs: Vec<BusGraph> = read_graph_from_file(NO_NODE_WEIGHT_PATH);
+        let graphs: Vec<BusGraph> = read_graph_from_file(NO_NODE_WEIGHT_PATH_IN);
         let trip_ids = soc_aware_rotation_plan(&graphs[0]);
         let count = total_rotation_count(&trip_ids, &graphs[0]);
         assert_eq!(count, 62);
@@ -840,50 +850,85 @@ mod tests {
 
     #[test]
     fn test_schedule_no_node_weight() {
-        let graphs: Vec<BusGraph> = read_graph_from_file(NO_NODE_WEIGHT_PATH);
+        let graphs: Vec<BusGraph> = read_graph_from_file(NO_NODE_WEIGHT_PATH_IN);
 
-        let mut number_of_schedules = Vec::new();
+        let mut all_trip_ids: Vec<Vec<(TripId, TripId)>> = Vec::new();
 
         for graph in &graphs {
             let trip_ids = soc_aware_rotation_plan(graph);
 
             validate_sum_of_node_weights(&trip_ids, graph);
 
-            let count = total_rotation_count(&trip_ids, graph);
-            number_of_schedules.push(count);
+            all_trip_ids.push(trip_ids);
         }
+        // Read in the expected result
+        let expected_result = serde_json::from_str::<Vec<Vec<(TripId, TripId)>>>(
+            &std::fs::read_to_string(NO_NODE_WEIGHT_PATH_OUT).expect("Could not read file"),
+        ).unwrap();
 
-        let number_of_edges = [62, 20, 5, 3, 3, 2, 2, 1, 1, 1, 1, 1];
-        assert_eq!(number_of_schedules, Vec::from(&number_of_edges[..]));
+        assert_eq!(all_trip_ids, expected_result);
     }
 
     #[test]
     fn test_schedule_one_node_weight() {
-        let graphs: Vec<BusGraph> = read_graph_from_file(ONE_NODE_WEIGHT_PATH);
-        let trip_ids = soc_aware_rotation_plan(&graphs[0]);
+        let graphs: Vec<BusGraph> = read_graph_from_file(ONE_NODE_WEIGHT_PATH_IN);
 
-        validate_sum_of_node_weights(&trip_ids, &graphs[0]);
-
-        let count = total_rotation_count(&trip_ids, &graphs[0]);
-        assert_eq!(count, 270);
-    }
-
-    #[test]
-    fn test_schedule_both_node_weights() {
-        let graphs: Vec<BusGraph> = read_graph_from_file(BOTH_NODE_WEIGHTS_PATH);
-
-        let mut number_of_schedules = Vec::new();
+        let mut all_trip_ids: Vec<Vec<(TripId, TripId)>> = Vec::new();
 
         for graph in &graphs {
             let trip_ids = soc_aware_rotation_plan(graph);
 
             validate_sum_of_node_weights(&trip_ids, graph);
 
-            let count = total_rotation_count(&trip_ids, graph);
-            number_of_schedules.push(count);
+            all_trip_ids.push(trip_ids);
         }
+        // Read in the expected result
+        let expected_result = serde_json::from_str::<Vec<Vec<(TripId, TripId)>>>(
+            &std::fs::read_to_string(ONE_NODE_WEIGHT_PATH_OUT).expect("Could not read file"),
+        ).unwrap();
 
-        let number_of_edges = [268, 103, 21, 12, 12, 14, 5, 4, 1, 1, 1, 1];
-        assert_eq!(number_of_schedules, number_of_edges);
+        assert_eq!(all_trip_ids, expected_result);
+    }
+
+    #[test]
+    fn test_schedule_both_node_weights() {
+        let graphs: Vec<BusGraph> = read_graph_from_file(BOTH_NODE_WEIGHTS_PATH_IN);
+
+        let mut all_trip_ids: Vec<Vec<(TripId, TripId)>> = Vec::new();
+
+        for graph in &graphs {
+            let trip_ids = soc_aware_rotation_plan(graph);
+
+            validate_sum_of_node_weights(&trip_ids, graph);
+
+            all_trip_ids.push(trip_ids);
+        }
+        // Read in the expected result
+        let expected_result = serde_json::from_str::<Vec<Vec<(TripId, TripId)>>>(
+            &std::fs::read_to_string(BOTH_NODE_WEIGHTS_PATH_OUT).expect("Could not read file"),
+        ).unwrap();
+
+        assert_eq!(all_trip_ids, expected_result);
+    }
+
+    #[test]
+    fn test_schedule_architecture_dependent() {
+        let graphs: Vec<BusGraph> = read_graph_from_file(ARCH_DEPENDENT_RESULT_PATH_IN);
+
+        let mut all_trip_ids: Vec<Vec<(TripId, TripId)>> = Vec::new();
+
+        for graph in &graphs {
+            let trip_ids = soc_aware_rotation_plan(graph);
+
+            validate_sum_of_node_weights(&trip_ids, graph);
+
+            all_trip_ids.push(trip_ids);
+        }
+        // Read in the expected result
+        let expected_result = serde_json::from_str::<Vec<Vec<(TripId, TripId)>>>(
+            &std::fs::read_to_string(ARCH_DEPENDENT_RESULT_PATH_OUT).expect("Could not read file"),
+        ).unwrap();
+
+        assert_eq!(all_trip_ids, expected_result);
     }
 }
