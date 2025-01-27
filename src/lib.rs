@@ -199,7 +199,7 @@ fn find_excessive_nodes_for_rotation(
 
         if weight_sums.into_iter().any(|x| x > NODE_WEIGHT_LIMIT) {
             let mut ret_val = connected_set.clone();
-            ret_val.sort_unstable_by_key(|node| {
+            ret_val.sort_by_key(|node| {
                 *bus_graph
                     .topo_order
                     .get(node)
@@ -588,6 +588,12 @@ fn maximum_matching(graph: BipartiteGraph) -> Vec<(TripId, TripId)> {
 
     // For each of these sets, solve the maximum matching problem
     for connected_set in connected_sets {
+        // Throw away every set that is not size 786
+        if connected_set.len() != 786 {
+            continue;
+        }
+        // Do a debug dump of the graph
+        write_debug_dotfile(&graph, &connected_set);
         // In the special case of our set only having one node, no matching is possible
         if connected_set.len() == 1 {
             continue;
@@ -735,7 +741,7 @@ fn maximum_matching(graph: BipartiteGraph) -> Vec<(TripId, TripId)> {
                 // one. However, by sorting the edges by their weight, we can get a good approximation
                 // of the best matching
                 edge_list
-                    .sort_unstable_by_key(|edge| *wait_times.get(edge).expect("Edge not found!"));
+                    .sort_by_key(|edge| *wait_times.get(edge).expect("Edge not found!"));
 
                 // We were not able to find a matching that covers all top nodes
                 // We need to use the Hopcroft-Karp algorithm
