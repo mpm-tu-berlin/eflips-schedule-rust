@@ -18,7 +18,7 @@ class TheTestCase(unittest.TestCase):
 
         # graphs is a list of dictionaries, each dictionary has "nodes" and "edges" keys
         for graph in graphs:
-            result = solve(json.dumps([graph]))
+            result = solve(json.dumps([graph]), max_delta_soc=None, max_duration=None)
 
             # The result is a list of edges, each edge is a list of two nodes
             # Assemble a networkx graph from the result
@@ -39,13 +39,13 @@ class TheTestCase(unittest.TestCase):
         )
         with open(graph_file, "r") as f:
             graphs = json.load(f)
-        result = solve(json.dumps(graphs))
+        result = solve(json.dumps(graphs), max_delta_soc=1.0, max_duration=None)
 
         number_of_schedules = []
 
         # graphs is a list of dictionaries, each dictionary has "nodes" and "edges" keys
         for graph in graphs:
-            result = solve(json.dumps([graph]))
+            result = solve(json.dumps([graph]), max_delta_soc=1.0, max_duration=None)
 
             # The result is a list of edges, each edge is a list of two nodes
             # Assemble a networkx graph from the result
@@ -57,9 +57,7 @@ class TheTestCase(unittest.TestCase):
             number_of_schedules.append(nx.number_connected_components(G))
 
         # Print the number of connected components
-        self.assertEqual(
-            number_of_schedules, [268, 103, 21, 12, 12, 14, 5, 4, 1, 1, 1, 1]
-        )
+        self.assertEqual(number_of_schedules, [142, 64, 21, 11, 9, 5, 5, 2, 1, 1, 1, 1])
 
 
 if __name__ == "__main__":

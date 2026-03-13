@@ -6,25 +6,31 @@ use petgraph::visit::EdgeRef;
 use petgraph::{Directed, Graph, Undirected};
 use pyo3::prelude::*;
 use rayon::prelude::*;
+use rustc_hash::FxHashMap as HashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-const NODE_WEIGHT_LIMIT: SingleNodeWeight = 1.0;
-const NODE_WEIGHT_SIZE: usize = 2;
-
 pub type TripId = u64;
-pub type SingleNodeWeight = f32;
-pub type NodeWeight = [SingleNodeWeight; NODE_WEIGHT_SIZE];
-pub type EdgeWeight = u64;
+pub type DeltaSoC = f32; // 0 - 1
+pub type Duration = u64; // seconds
+#[derive(Serialize, Deserialize, Clone, Debug, Copy, Default)]
+pub struct NodeWeight {
+    delta_soc: DeltaSoC,
+    duration: Duration,
+}
+pub type EdgeWeight = Duration;
 
 /// Solve the vehicle scheduling problem
 /// This is the entry point (and only exposed function) for the Python module
 /// It takes a JSON string as input and returns a list of (TripId, TripId) pairs
 #[pyfunction]
-pub fn solve(input_json: String) -> PyResult<Vec<(TripId, TripId)>> {
+pub fn solve(
+    input_json: String,
+    max_delta_soc: Option<DeltaSoC>,
+    max_duration: Option<Duration>,
+) -> PyResult<Vec<(TripId, TripId)>> {
     let input_json = input_json.to_string();
     let json_file = read_graph_from_string(input_json);
-    let result = soc_aware_rotation_plan_vec(&json_file);
+    let result = soc_aware_rotation_plan_vec(&json_file, max_delta_soc, max_duration);
 
     Ok(result)
 }
@@ -37,11 +43,11 @@ pub fn eflips_schedule_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 /// The list of nodes is an inner level structure of the graph
-/// The IDs are TripIds, the weights are delta_soc_effective values
+/// The IDs are TripIds, the weights are a delta_soc_effective, duration tuple.
 #[derive(Serialize, Deserialize)]
 struct JsonNode {
     id: TripId,
-    weight: [Option<SingleNodeWeight>; NODE_WEIGHT_SIZE],
+    weight: (Option<DeltaSoC>, Option<Duration>),
 }
 
 /// The list of edges is an inner level structure of the graph
@@ -100,16 +106,16 @@ fn json_graph_to_bus_graph(json_graphs: Vec<JsonGraph>) -> Vec<BusGraph> {
     let mut all_graphs = Vec::new();
     for json_graph in json_graphs {
         // Set up nodes and corresponding ID maps
-        let mut trip_id_node_id: HashMap<TripId, NodeIndex> = HashMap::new();
+        let mut trip_id_node_id: HashMap<TripId, NodeIndex> = HashMap::default();
         let mut graph = StableDiGraph::new();
         for node in json_graph.nodes {
             // Turn the None values into 0.0
-            let mut weight = [0.0; NODE_WEIGHT_SIZE];
-            for (i, weight_value) in node.weight.iter().enumerate() {
-                weight[i] = weight_value.unwrap_or(0.0);
-            }
+            let weight = NodeWeight {
+                delta_soc: node.weight.0.unwrap_or(0.0),
+                duration: node.weight.1.unwrap_or(0),
+            };
 
-            let node_id = graph.add_node(weight as NodeWeight);
+            let node_id = graph.add_node(weight);
             trip_id_node_id.insert(node.id as TripId, node_id);
         }
         let node_id_trip_id: HashMap<NodeIndex, TripId> =
@@ -128,7 +134,7 @@ fn json_graph_to_bus_graph(json_graphs: Vec<JsonGraph>) -> Vec<BusGraph> {
 
         // Calculate the topological order of the nodes
         let toposort = petgraph::algo::toposort(&graph, None).expect("Graph is not a DAG");
-        let mut topo_order: HashMap<NodeIndex, usize> = HashMap::new();
+        let mut topo_order: HashMap<NodeIndex, usize> = HashMap::default();
         for (i, node) in toposort.iter().enumerate() {
             topo_order.insert(*node, i);
         }
@@ -182,68 +188,64 @@ fn assemble_working_graph(
     working_graph
 }
 
-/// Find which nodes in a connected set of nodes are exceeding limits of node weight sum
-fn find_excessive_nodes_for_rotation(
-    connected_set: &Vec<NodeIndex>,
+fn sort_rotation_topologically(nodes: &[NodeIndex], bus_graph: &BusGraph) -> Vec<NodeIndex> {
+    let mut sorted = nodes.to_vec();
+    sorted.sort_unstable_by_key(|n| {
+        *bus_graph
+            .topo_order
+            .get(n)
+            .expect("Node not found in topo map")
+    });
+    sorted
+}
+
+fn exceeds_limits(
+    weight: &NodeWeight,
+    max_delta_soc: Option<DeltaSoC>,
+    max_duration: Option<Duration>,
+) -> bool {
+    max_delta_soc.is_some_and(|max| weight.delta_soc > max)
+        || max_duration.is_some_and(|max| weight.duration > max)
+}
+
+/// Returns the index of the first node (in the given sorted slice) where the cumulative
+/// weight (node weights + inter-trip edge weights) first exceeds the given limits.
+/// Returns None if no limit is exceeded.
+fn first_excess_index(
+    sorted_nodes: &[NodeIndex],
     bus_graph: &BusGraph,
-) -> Option<Vec<NodeIndex>> {
-    let mut weight_sums: NodeWeight = [0.0; NODE_WEIGHT_SIZE];
-    for node in connected_set {
-        let cur_trip_weight = *bus_graph
+    max_delta_soc: Option<DeltaSoC>,
+    max_duration: Option<Duration>,
+) -> Option<usize> {
+    let mut weight = NodeWeight::default();
+    for (i, node) in sorted_nodes.iter().enumerate() {
+        if i > 0 {
+            let prev = sorted_nodes[i - 1];
+            let edge = bus_graph.graph.find_edge_undirected(prev, *node);
+            weight.duration += *bus_graph.graph.edge_weight(edge.unwrap().0).unwrap();
+        }
+        let nw = *bus_graph
             .graph
             .node_weight(*node)
             .expect("Node has no weight!");
-        for i in 0..NODE_WEIGHT_SIZE {
-            weight_sums[i] += cur_trip_weight[i];
-        }
-
-        if weight_sums.into_iter().any(|x| x > NODE_WEIGHT_LIMIT) {
-            let mut ret_val = connected_set.clone();
-            ret_val.sort_unstable_by_key(|node| {
-                *bus_graph
-                    .topo_order
-                    .get(node)
-                    .expect("Node not found in topo map")
-            });
-            return Some(ret_val);
+        weight.delta_soc += nw.delta_soc;
+        weight.duration += nw.duration;
+        if exceeds_limits(&weight, max_delta_soc, max_duration) {
+            return Some(i);
         }
     }
     None
 }
 
-/// Calculate the sum of weights of the nodes in a connected set
-fn node_weight_sum(connected_set: &Vec<NodeIndex>, bus_graph: &BusGraph) -> NodeWeight {
-    let mut weight_sums: NodeWeight = [0.0; NODE_WEIGHT_SIZE];
-    for node in connected_set {
-        let cur_trip_weight = *bus_graph
-            .graph
-            .node_weight(*node)
-            .expect("Node has no weight!");
-        for i in 0..NODE_WEIGHT_SIZE {
-            weight_sums[i] += cur_trip_weight[i];
-        }
-    }
-    weight_sums
-}
-
-/// Find the highest sum of weights of the nodes in a connected set
-fn max_weight_rotation(
-    rotation_connections: &Vec<(TripId, TripId)>,
+/// Returns true if the cumulative weight of the rotation exceeds the given limits.
+fn is_rotation_excessive(
+    connected_set: &[NodeIndex],
     bus_graph: &BusGraph,
-) -> NodeWeight {
-    let working_graph = assemble_working_graph(rotation_connections, bus_graph);
-    let connected_sets = petgraph::algo::kosaraju_scc(&working_graph);
-
-    let mut max_weight_so_far: NodeWeight = [0.0; NODE_WEIGHT_SIZE];
-    for connected_set in connected_sets {
-        let weight_sum_of_set = node_weight_sum(&connected_set, bus_graph);
-        for i in 0..NODE_WEIGHT_SIZE {
-            if weight_sum_of_set[i] > max_weight_so_far[i] {
-                max_weight_so_far[i] = weight_sum_of_set[i];
-            }
-        }
-    }
-    max_weight_so_far
+    max_delta_soc: Option<DeltaSoC>,
+    max_duration: Option<Duration>,
+) -> bool {
+    let sorted = sort_rotation_topologically(connected_set, bus_graph);
+    first_excess_index(&sorted, bus_graph, max_delta_soc, max_duration).is_some()
 }
 
 /// Find the node lists of the rotations with delta_soc_effective > 1
@@ -251,15 +253,16 @@ fn max_weight_rotation(
 fn excessive_rotations(
     rotation_connections: &Vec<(TripId, TripId)>,
     bus_graph: &BusGraph,
+    max_delta_soc: Option<DeltaSoC>,
+    max_duration: Option<Duration>,
 ) -> Vec<Vec<NodeIndex>> {
     let working_graph = assemble_working_graph(rotation_connections, bus_graph);
 
     let connected_sets = petgraph::algo::kosaraju_scc(&working_graph);
     let mut excessive_soc_rotations: Vec<Vec<NodeIndex>> = Vec::new();
     for connected_set in connected_sets {
-        let excessive_rotation = find_excessive_nodes_for_rotation(&connected_set, bus_graph);
-        if let Some(rotation) = excessive_rotation {
-            excessive_soc_rotations.push(rotation)
+        if is_rotation_excessive(&connected_set, bus_graph, max_delta_soc, max_duration) {
+            excessive_soc_rotations.push(connected_set);
         }
     }
     excessive_soc_rotations
@@ -267,37 +270,20 @@ fn excessive_rotations(
 
 /// Take a list of nodes of a rotation that has excessive SOC
 /// and return the amount of it from the start up to the last one that
-fn nodes_to_remove_forward(rotation: &Vec<NodeIndex>, bus_graph: &BusGraph) -> Vec<NodeIndex> {
-    let mut nodes_to_keep: Vec<NodeIndex> = Vec::new();
-    let mut weight_sums: NodeWeight = [0.0; NODE_WEIGHT_SIZE];
-    for node in rotation {
-        let cur_trip_weight = *bus_graph
-            .graph
-            .node_weight(*node)
-            .expect("Node has no weight!");
-
-        // Add the weight of the current node to the weight sum
-        for i in 0..NODE_WEIGHT_SIZE {
-            weight_sums[i] += cur_trip_weight[i];
-        }
-
-        // If any of the weight sums exceed the limit, we stop
-        // So far, we have added nodes to keep, up to the node before the one that exceeded the limit
-        if weight_sums.into_iter().any(|x| x > NODE_WEIGHT_LIMIT) {
-            break;
-        }
-
-        // If the weight sum is still below the limit, we add the node to the list of nodes to keep
-        nodes_to_keep.push(*node);
+fn nodes_to_remove(
+    rotation: &Vec<NodeIndex>,
+    bus_graph: &BusGraph,
+    max_delta_soc: Option<DeltaSoC>,
+    max_duration: Option<Duration>,
+    forward: bool,
+) -> Vec<NodeIndex> {
+    let mut sorted = sort_rotation_topologically(rotation, bus_graph);
+    if !forward {
+        sorted.reverse();
     }
-    nodes_to_keep
-}
-
-/// Take a list of nodes of a rotation that has excessive SOC
-/// amd return the amount of it from the end up to the last one that
-/// has a delta_soc_effective <= 1
-fn nodes_to_remove_backward(rotation: &[NodeIndex], bus_graph: &BusGraph) -> Vec<NodeIndex> {
-    nodes_to_remove_forward(&rotation.iter().rev().cloned().collect(), bus_graph)
+    let cutoff =
+        first_excess_index(&sorted, bus_graph, max_delta_soc, max_duration).unwrap_or(sorted.len());
+    sorted[..cutoff].to_vec()
 }
 
 /// Calculate the cost of removing a set of nodes from the graph. THis is evaluated for all
@@ -306,18 +292,17 @@ fn cost_of_removal(
     rotation: &Vec<NodeIndex>,
     working_graph: &BusGraph,
     graph: &BusGraph,
+    max_delta_soc: Option<DeltaSoC>,
+    max_duration: Option<Duration>,
 ) -> (Vec<NodeIndex>, usize) {
     /// The weight we give to the total number of rotations
     const TOTAL_ROTATIONS_WEIGHT: usize = 1e9 as usize;
-
-    /// The weight we give to the weight of the rotation with the highest weight
-    const MAX_WEIGHT_WEIGHT: usize = 0;
 
     /// The weight we give to the number of excessive rotations
     /// This is a tiebreaker in case the total number of rotations is the same
     const EXCESSIVE_ROTATIONS_WEIGHT: usize = 1;
 
-    let nodes_to_remove_front = nodes_to_remove_forward(rotation, graph);
+    let nodes_to_remove_front = nodes_to_remove(rotation, graph, max_delta_soc, max_duration, true);
     let weight_front = {
         // Remove the nodes from a copy of the graph
         let mut bus_graph_copy = working_graph.clone();
@@ -331,19 +316,18 @@ fn cost_of_removal(
         // Calculate some quality metrics
         let total_rotations_after_removal_front =
             total_rotation_count(&rotation_plan_after_removal_front, &bus_graph_copy);
-        let excessive_rotations_after_removal_front =
-            excessive_rotations(&rotation_plan_after_removal_front, &bus_graph_copy).len();
-        let max_weight_after_removal_front =
-            max_weight_rotation(&rotation_plan_after_removal_front, &bus_graph_copy)
-                .into_iter()
-                .max_by(|a, b| a.partial_cmp(b).unwrap())
-                .unwrap() as usize;
+        let excessive_rotations_after_removal_front = excessive_rotations(
+            &rotation_plan_after_removal_front,
+            &bus_graph_copy,
+            max_delta_soc,
+            max_duration,
+        )
+        .len();
         total_rotations_after_removal_front * TOTAL_ROTATIONS_WEIGHT
-            + max_weight_after_removal_front * MAX_WEIGHT_WEIGHT
             + excessive_rotations_after_removal_front * EXCESSIVE_ROTATIONS_WEIGHT
     };
 
-    let nodes_to_remove_back = nodes_to_remove_backward(rotation, graph);
+    let nodes_to_remove_back = nodes_to_remove(rotation, graph, max_delta_soc, max_duration, false);
     let weight_back = {
         // Remove the nodes from a copy of the graph
         let mut bus_graph_copy = working_graph.clone();
@@ -354,15 +338,14 @@ fn cost_of_removal(
         let rotation_plan_after_removal_back = maximum_matching(bipartite_graph);
         let total_rotations_after_removal_back =
             total_rotation_count(&rotation_plan_after_removal_back, &bus_graph_copy);
-        let excessive_rotations_after_removal_back =
-            excessive_rotations(&rotation_plan_after_removal_back, &bus_graph_copy).len();
-        let max_weight_after_removal_back =
-            max_weight_rotation(&rotation_plan_after_removal_back, &bus_graph_copy)
-                .into_iter()
-                .max_by(|a, b| a.partial_cmp(b).unwrap())
-                .unwrap() as usize;
+        let excessive_rotations_after_removal_back = excessive_rotations(
+            &rotation_plan_after_removal_back,
+            &bus_graph_copy,
+            max_delta_soc,
+            max_duration,
+        )
+        .len();
         total_rotations_after_removal_back * TOTAL_ROTATIONS_WEIGHT
-            + max_weight_after_removal_back * MAX_WEIGHT_WEIGHT
             + excessive_rotations_after_removal_back * EXCESSIVE_ROTATIONS_WEIGHT
     };
 
@@ -377,7 +360,11 @@ fn cost_of_removal(
 }
 
 /// Solve the rotation plan problem in a SOC-aware way
-pub fn soc_aware_rotation_plan(graph: &BusGraph) -> Vec<(TripId, TripId)> {
+pub fn soc_aware_rotation_plan(
+    graph: &BusGraph,
+    max_delta_soc: Option<DeltaSoC>,
+    max_duration: Option<Duration>,
+) -> Vec<(TripId, TripId)> {
     ///Whether to use rayon for parallel processing
     const PARALLEL: bool = true;
 
@@ -388,7 +375,8 @@ pub fn soc_aware_rotation_plan(graph: &BusGraph) -> Vec<(TripId, TripId)> {
     let mut rotations_removed: Vec<Vec<NodeIndex>> = Vec::new();
     let mut working_graph = graph.clone();
     loop {
-        let the_excessive_soc_rotations = excessive_rotations(&rotation_plan, &working_graph);
+        let the_excessive_soc_rotations =
+            excessive_rotations(&rotation_plan, &working_graph, max_delta_soc, max_duration);
         if the_excessive_soc_rotations.is_empty() {
             break;
         }
@@ -401,14 +389,27 @@ pub fn soc_aware_rotation_plan(graph: &BusGraph) -> Vec<(TripId, TripId)> {
                 );
                 the_excessive_soc_rotations
                     .into_par_iter()
-                    .map(|rotation| cost_of_removal(&rotation, &working_graph, graph))
+                    .map(|rotation| {
+                        cost_of_removal(
+                            &rotation,
+                            &working_graph,
+                            graph,
+                            max_delta_soc,
+                            max_duration,
+                        )
+                    })
                     .collect::<Vec<(Vec<NodeIndex>, usize)>>()
             } else {
                 warn!("Not using parallel processing!");
                 let mut effects_of_removal: Vec<(Vec<NodeIndex>, usize)> = Vec::new();
                 for rotation in &the_excessive_soc_rotations {
-                    let (nodes_to_remove, effect) =
-                        cost_of_removal(rotation, &working_graph, graph);
+                    let (nodes_to_remove, effect) = cost_of_removal(
+                        rotation,
+                        &working_graph,
+                        graph,
+                        max_delta_soc,
+                        max_duration,
+                    );
                     effects_of_removal.push((nodes_to_remove, effect));
                 }
                 effects_of_removal
@@ -462,10 +463,14 @@ pub fn soc_aware_rotation_plan(graph: &BusGraph) -> Vec<(TripId, TripId)> {
 }
 
 /// Convenience method to calculate the SoC-aware rotation plan for a vector of graphs
-fn soc_aware_rotation_plan_vec(graphs: &Vec<BusGraph>) -> Vec<(TripId, TripId)> {
+fn soc_aware_rotation_plan_vec(
+    graphs: &Vec<BusGraph>,
+    max_delta_soc: Option<DeltaSoC>,
+    max_duration: Option<Duration>,
+) -> Vec<(TripId, TripId)> {
     let mut results: Vec<(TripId, TripId)> = Vec::new();
     for graph in graphs {
-        let edged = soc_aware_rotation_plan(graph);
+        let edged = soc_aware_rotation_plan(graph, max_delta_soc, max_duration);
         for edge in edged {
             results.push(edge);
         }
@@ -486,8 +491,8 @@ fn to_bipartite(graph: &BusGraph) -> BipartiteGraph {
     let mut bipartite_graph: Graph<String, EdgeWeight, Undirected> = Graph::new_undirected();
 
     // Add nodes to the bipartite graph
-    let mut top_node_id_bipartite_node_id: HashMap<NodeIndex, NodeIndex> = HashMap::new();
-    let mut bottom_biparite_node_id_node_id: HashMap<NodeIndex, NodeIndex> = HashMap::new();
+    let mut top_node_id_bipartite_node_id: HashMap<NodeIndex, NodeIndex> = HashMap::default();
+    let mut bottom_bipartite_node_id_node_id: HashMap<NodeIndex, NodeIndex> = HashMap::default();
 
     for node in graph.graph.node_indices() {
         let trip_id = *graph.node_id_trip_id.get(&node).expect("Node not found!");
@@ -496,8 +501,8 @@ fn to_bipartite(graph: &BusGraph) -> BipartiteGraph {
         top_node_id_bipartite_node_id.insert(node, top_node_idx);
 
         let bottom_node_label = format!("{}-bottom", trip_id);
-        let bottom_noe_idx = bipartite_graph.add_node(bottom_node_label);
-        bottom_biparite_node_id_node_id.insert(node, bottom_noe_idx);
+        let bottom_node_idx = bipartite_graph.add_node(bottom_node_label);
+        bottom_bipartite_node_id_node_id.insert(node, bottom_node_idx);
     }
 
     // Add the edges with their weight
@@ -506,7 +511,7 @@ fn to_bipartite(graph: &BusGraph) -> BipartiteGraph {
             let bipartite_top_idx = top_node_id_bipartite_node_id
                 .get(&edge.source())
                 .expect("Node not found!");
-            let bipartite_bottom_idx = bottom_biparite_node_id_node_id
+            let bipartite_bottom_idx = bottom_bipartite_node_id_node_id
                 .get(&edge.target())
                 .expect("Node not found!");
             bipartite_graph.add_edge(*bipartite_top_idx, *bipartite_bottom_idx, *edge.weight());
@@ -514,7 +519,7 @@ fn to_bipartite(graph: &BusGraph) -> BipartiteGraph {
     }
 
     // Assemble a map from the bipartite graph node ids to the original trip ids
-    let mut top_node_id_trip_id: HashMap<NodeIndex, TripId> = HashMap::new();
+    let mut top_node_id_trip_id: HashMap<NodeIndex, TripId> = HashMap::default();
     for (node_id, bipartite_node_id) in top_node_id_bipartite_node_id {
         top_node_id_trip_id.insert(
             bipartite_node_id,
@@ -524,8 +529,8 @@ fn to_bipartite(graph: &BusGraph) -> BipartiteGraph {
                 .expect("Node not found!"),
         );
     }
-    let mut bottom_node_id_trip_id: HashMap<NodeIndex, TripId> = HashMap::new();
-    for (node_id, bipartite_node_id) in bottom_biparite_node_id_node_id {
+    let mut bottom_node_id_trip_id: HashMap<NodeIndex, TripId> = HashMap::default();
+    for (node_id, bipartite_node_id) in bottom_bipartite_node_id_node_id {
         bottom_node_id_trip_id.insert(
             bipartite_node_id,
             *graph
@@ -628,8 +633,8 @@ fn maximum_matching(graph: BipartiteGraph) -> Vec<(TripId, TripId)> {
             // bottom, and the "narrower" set of nodes is at the top
             // This means we may need to swap the top and bottom nodes
             // We call them row and column nodes, for their usage in the Hungarian algorithm
-            let mut row_trip_id: HashMap<NodeIndex, TripId> = HashMap::new();
-            let mut column_trip_id: HashMap<NodeIndex, TripId> = HashMap::new();
+            let mut row_trip_id: HashMap<NodeIndex, TripId> = HashMap::default();
+            let mut column_trip_id: HashMap<NodeIndex, TripId> = HashMap::default();
 
             let mut inverted = false;
             let (column_nodes, row_nodes) = {
@@ -719,7 +724,7 @@ fn maximum_matching(graph: BipartiteGraph) -> Vec<(TripId, TripId)> {
 
                 // The hopcroft_karp package takes an edge list as input, so we need to convert our
                 // graph to this format
-                let mut wait_times = HashMap::new();
+                let mut wait_times = HashMap::default();
                 let mut edge_list: Vec<(NodeIndex, NodeIndex)> = Vec::new();
                 for node in &row_nodes {
                     for edge in graph.graph.edges(*node) {
@@ -805,15 +810,54 @@ mod tests {
     /// placed on, and checks if the sum of the node weights of the nodes in the connected set
     /// is below the limit
     /// Panics if the sum of the node weights is above the limit
-    fn validate_sum_of_node_weights(solution: &Vec<(TripId, TripId)>, graph: &BusGraph) {
+    fn validate_sum_of_node_weights(
+        solution: &Vec<(TripId, TripId)>,
+        graph: &BusGraph,
+        max_delta_soc: Option<DeltaSoC>,
+        max_duration: Option<Duration>,
+    ) {
         let working_graph = assemble_working_graph(solution, graph);
         let connected_sets = petgraph::algo::kosaraju_scc(&working_graph);
         for connected_set in connected_sets {
             let weight_sum = node_weight_sum(&connected_set, graph);
-            if weight_sum.into_iter().any(|x| x > NODE_WEIGHT_LIMIT) {
-                panic!("Node weight sum exceeded limit!");
+            if max_delta_soc.is_some() && weight_sum.delta_soc > max_delta_soc.unwrap() {
+                panic!(
+                    "max_delta_soc is {}, actual {}",
+                    max_delta_soc.unwrap(),
+                    weight_sum.delta_soc
+                );
+            }
+            if max_duration.is_some() && weight_sum.duration > max_duration.unwrap() {
+                panic!(
+                    "max_duration is {}, actual {}",
+                    max_duration.unwrap(),
+                    weight_sum.duration
+                );
             }
         }
+    }
+
+    /// Calculate the sum of weights of the nodes in a connected set
+    fn node_weight_sum(connected_set: &Vec<NodeIndex>, bus_graph: &BusGraph) -> NodeWeight {
+        let sorted_connected_set = sort_rotation_topologically(connected_set, bus_graph);
+        let mut weight_sums = NodeWeight::default();
+        for (i, node) in sorted_connected_set.iter().enumerate() {
+            let cur_trip_weight = *bus_graph
+                .graph
+                .node_weight(*node)
+                .expect("Node has no weight!");
+            weight_sums.delta_soc += cur_trip_weight.delta_soc;
+            weight_sums.duration += cur_trip_weight.duration;
+
+            // For the duration, we also have to count the edge weight (which is a waiting duration) into the total.
+            if i < sorted_connected_set.len() - 1 {
+                let next_node = sorted_connected_set[i + 1];
+                let edge = bus_graph.graph.find_edge_undirected(*node, next_node);
+                let edge_weight = bus_graph.graph.edge_weight(edge.unwrap().0).unwrap();
+                weight_sums.duration += *edge_weight;
+            }
+        }
+        weight_sums
     }
 
     #[test]
@@ -833,7 +877,7 @@ mod tests {
     #[test]
     fn test_total_rotation_count() {
         let graphs: Vec<BusGraph> = read_graph_from_file(NO_NODE_WEIGHT_PATH);
-        let trip_ids = soc_aware_rotation_plan(&graphs[0]);
+        let trip_ids = soc_aware_rotation_plan(&graphs[0], 1.0.into(), None);
         let count = total_rotation_count(&trip_ids, &graphs[0]);
         assert_eq!(count, 62);
     }
@@ -845,9 +889,10 @@ mod tests {
         let mut number_of_schedules = Vec::new();
 
         for graph in &graphs {
-            let trip_ids = soc_aware_rotation_plan(graph);
+            let trip_ids = soc_aware_rotation_plan(graph, None, None);
 
-            validate_sum_of_node_weights(&trip_ids, graph);
+            // The "None" node weights in the input file should be converted to zeroes. Therefore, all values should be zeroes, that's what we're checking for here.
+            validate_sum_of_node_weights(&trip_ids, graph, 0.0.into(), None);
 
             let count = total_rotation_count(&trip_ids, graph);
             number_of_schedules.push(count);
@@ -860,9 +905,9 @@ mod tests {
     #[test]
     fn test_schedule_one_node_weight() {
         let graphs: Vec<BusGraph> = read_graph_from_file(ONE_NODE_WEIGHT_PATH);
-        let trip_ids = soc_aware_rotation_plan(&graphs[0]);
+        let trip_ids = soc_aware_rotation_plan(&graphs[0], 1.0.into(), None);
 
-        validate_sum_of_node_weights(&trip_ids, &graphs[0]);
+        validate_sum_of_node_weights(&trip_ids, &graphs[0], 1.0.into(), None);
 
         let count = total_rotation_count(&trip_ids, &graphs[0]);
         assert_eq!(count, 270);
@@ -875,15 +920,15 @@ mod tests {
         let mut number_of_schedules = Vec::new();
 
         for graph in &graphs {
-            let trip_ids = soc_aware_rotation_plan(graph);
+            let trip_ids = soc_aware_rotation_plan(graph, 1.0.into(), 86400.into());
 
-            validate_sum_of_node_weights(&trip_ids, graph);
+            validate_sum_of_node_weights(&trip_ids, graph, 1.0.into(), 86400.into());
 
             let count = total_rotation_count(&trip_ids, graph);
             number_of_schedules.push(count);
         }
 
-        let number_of_edges = [268, 103, 21, 12, 12, 14, 5, 4, 1, 1, 1, 1];
+        let number_of_edges = [280, 103, 21, 12, 12, 14, 5, 4, 1, 1, 1, 1];
         assert_eq!(number_of_schedules, number_of_edges);
     }
 }

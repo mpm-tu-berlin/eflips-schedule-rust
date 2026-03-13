@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "eflips-schedule-rust"
-version = "2.0.4"
+version = "3.0.0"
 dependencies = [
  "env_logger",
  "hopcroft-karp",
@@ -127,6 +127,7 @@ dependencies = [
  "petgraph",
  "pyo3",
  "rayon",
+ "rustc-hash",
  "serde",
  "serde_json",
 ]
