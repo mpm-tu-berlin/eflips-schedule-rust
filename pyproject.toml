@@ -16,7 +16,7 @@ authors = [
   {name = "Ludger Heide", email = "ludger.heide@tu-berlin.de"},
 ]
 readme = "README.md"
-license = "AGPLV3.md"
+license = "AGPL-3.0-or-later"
 
 
 [project.urls]

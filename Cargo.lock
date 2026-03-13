@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "eflips-schedule-rust"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "env_logger",
  "hopcroft-karp",
