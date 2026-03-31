@@ -9,9 +9,11 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap as HashMap;
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
-pub type TripId = u64;
+pub type TripId = u32;
 pub type DeltaSoC = f32; // 0 - 1
-pub type Duration = u64; // seconds
+pub type Duration = u32; // seconds
+/// Sentinel value for non-existent edges in the Hungarian algorithm's cost matrix.
+const NO_EDGE_WEIGHT: i64 = i32::MAX as i64;
 #[derive(Serialize, Deserialize, Clone, Debug, Copy, Default)]
 pub struct NodeWeight {
     delta_soc: DeltaSoC,
@@ -106,7 +108,7 @@ fn json_graph_to_bus_graph(json_graphs: Vec<JsonGraph>) -> Vec<BusGraph> {
     let mut all_graphs = Vec::new();
     for json_graph in json_graphs {
         // Set up nodes and corresponding ID maps
-        let mut trip_id_node_id: HashMap<TripId, NodeIndex> = HashMap::default();
+        let mut trip_id_node_id: HashMap<TripId, NodeIndex> = HashMap::with_capacity_and_hasher(json_graph.nodes.len(), Default::default());
         let mut graph = StableDiGraph::new();
         for node in json_graph.nodes {
             // Turn the None values into 0.0
@@ -116,7 +118,7 @@ fn json_graph_to_bus_graph(json_graphs: Vec<JsonGraph>) -> Vec<BusGraph> {
             };
 
             let node_id = graph.add_node(weight);
-            trip_id_node_id.insert(node.id as TripId, node_id);
+            trip_id_node_id.insert(node.id, node_id);
         }
         let node_id_trip_id: HashMap<NodeIndex, TripId> =
             trip_id_node_id.iter().map(|(k, v)| (*v, *k)).collect();
@@ -129,12 +131,12 @@ fn json_graph_to_bus_graph(json_graphs: Vec<JsonGraph>) -> Vec<BusGraph> {
             let target = trip_id_node_id
                 .get(&edge.target)
                 .expect("Target node not found");
-            graph.add_edge(*source, *target, edge.weight as EdgeWeight);
+            graph.add_edge(*source, *target, edge.weight);
         }
 
         // Calculate the topological order of the nodes
         let toposort = petgraph::algo::toposort(&graph, None).expect("Graph is not a DAG");
-        let mut topo_order: HashMap<NodeIndex, usize> = HashMap::default();
+        let mut topo_order: HashMap<NodeIndex, usize> = HashMap::with_capacity_and_hasher(toposort.len(), Default::default());
         for (i, node) in toposort.iter().enumerate() {
             topo_order.insert(*node, i);
         }
@@ -222,14 +224,17 @@ fn first_excess_index(
         if i > 0 {
             let prev = sorted_nodes[i - 1];
             let edge = bus_graph.graph.find_edge_undirected(prev, *node);
-            weight.duration += *bus_graph.graph.edge_weight(edge.unwrap().0).unwrap();
+            weight.duration = weight.duration.checked_add(
+                *bus_graph.graph.edge_weight(edge.unwrap().0).unwrap()
+            ).expect("Duration overflow in first_excess_index");
         }
         let nw = *bus_graph
             .graph
             .node_weight(*node)
             .expect("Node has no weight!");
         weight.delta_soc += nw.delta_soc;
-        weight.duration += nw.duration;
+        weight.duration = weight.duration.checked_add(nw.duration)
+            .expect("Duration overflow in first_excess_index");
         if exceeds_limits(&weight, max_delta_soc, max_duration) {
             return Some(i);
         }
@@ -479,7 +484,7 @@ fn soc_aware_rotation_plan_vec(
 }
 
 pub struct BipartiteGraph {
-    graph: Graph<String, EdgeWeight, Undirected>,
+    graph: Graph<(), EdgeWeight, Undirected>,
     top_node_id_trip_id: HashMap<NodeIndex, TripId>,
     bottom_node_id_trip_id: HashMap<NodeIndex, TripId>,
 }
@@ -488,20 +493,18 @@ pub struct BipartiteGraph {
 /// Where one set of  nodes only has outgoing edges and the other only incoming edges
 /// On this graph we can then solve the maximum matching problem
 fn to_bipartite(graph: &BusGraph) -> BipartiteGraph {
-    let mut bipartite_graph: Graph<String, EdgeWeight, Undirected> = Graph::new_undirected();
+    let node_count = graph.graph.node_count();
+    let mut bipartite_graph: Graph<(), EdgeWeight, Undirected> = Graph::with_capacity(node_count * 2, graph.graph.edge_count());
 
     // Add nodes to the bipartite graph
-    let mut top_node_id_bipartite_node_id: HashMap<NodeIndex, NodeIndex> = HashMap::default();
-    let mut bottom_bipartite_node_id_node_id: HashMap<NodeIndex, NodeIndex> = HashMap::default();
+    let mut top_node_id_bipartite_node_id: HashMap<NodeIndex, NodeIndex> = HashMap::with_capacity_and_hasher(node_count, Default::default());
+    let mut bottom_bipartite_node_id_node_id: HashMap<NodeIndex, NodeIndex> = HashMap::with_capacity_and_hasher(node_count, Default::default());
 
     for node in graph.graph.node_indices() {
-        let trip_id = *graph.node_id_trip_id.get(&node).expect("Node not found!");
-        let top_node_label = format!("{}-top", trip_id);
-        let top_node_idx = bipartite_graph.add_node(top_node_label);
+        let top_node_idx = bipartite_graph.add_node(());
         top_node_id_bipartite_node_id.insert(node, top_node_idx);
 
-        let bottom_node_label = format!("{}-bottom", trip_id);
-        let bottom_node_idx = bipartite_graph.add_node(bottom_node_label);
+        let bottom_node_idx = bipartite_graph.add_node(());
         bottom_bipartite_node_id_node_id.insert(node, bottom_node_idx);
     }
 
@@ -519,7 +522,7 @@ fn to_bipartite(graph: &BusGraph) -> BipartiteGraph {
     }
 
     // Assemble a map from the bipartite graph node ids to the original trip ids
-    let mut top_node_id_trip_id: HashMap<NodeIndex, TripId> = HashMap::default();
+    let mut top_node_id_trip_id: HashMap<NodeIndex, TripId> = HashMap::with_capacity_and_hasher(node_count, Default::default());
     for (node_id, bipartite_node_id) in top_node_id_bipartite_node_id {
         top_node_id_trip_id.insert(
             bipartite_node_id,
@@ -529,7 +532,7 @@ fn to_bipartite(graph: &BusGraph) -> BipartiteGraph {
                 .expect("Node not found!"),
         );
     }
-    let mut bottom_node_id_trip_id: HashMap<NodeIndex, TripId> = HashMap::default();
+    let mut bottom_node_id_trip_id: HashMap<NodeIndex, TripId> = HashMap::with_capacity_and_hasher(node_count, Default::default());
     for (node_id, bipartite_node_id) in bottom_bipartite_node_id_node_id {
         bottom_node_id_trip_id.insert(
             bipartite_node_id,
@@ -633,8 +636,9 @@ fn maximum_matching(graph: BipartiteGraph) -> Vec<(TripId, TripId)> {
             // bottom, and the "narrower" set of nodes is at the top
             // This means we may need to swap the top and bottom nodes
             // We call them row and column nodes, for their usage in the Hungarian algorithm
-            let mut row_trip_id: HashMap<NodeIndex, TripId> = HashMap::default();
-            let mut column_trip_id: HashMap<NodeIndex, TripId> = HashMap::default();
+            let half = connected_set.len() / 2 + 1;
+            let mut row_trip_id: HashMap<NodeIndex, TripId> = HashMap::with_capacity_and_hasher(half, Default::default());
+            let mut column_trip_id: HashMap<NodeIndex, TripId> = HashMap::with_capacity_and_hasher(half, Default::default());
 
             let mut inverted = false;
             let (column_nodes, row_nodes) = {
@@ -694,7 +698,7 @@ fn maximum_matching(graph: BipartiteGraph) -> Vec<(TripId, TripId)> {
                 for column in &column_nodes {
                     let edge_option = graph.graph.find_edge(*column, *row);
                     match edge_option {
-                        None => row_vec.push(i32::MAX as i64),
+                        None => row_vec.push(NO_EDGE_WEIGHT),
                         Some(edge) => {
                             row_vec
                                 .push(*graph.graph.edge_weight(edge).expect("Edge has no weight!")
@@ -711,8 +715,8 @@ fn maximum_matching(graph: BipartiteGraph) -> Vec<(TripId, TripId)> {
             // The Hungarian algorithm *may* have created a matching that includes a node that
             // doesn't actually have an edge in the graph. If that is the case, we'll have to
             // use hopcroft-karp instead.
-            // Invaliud matchings are marked by a total wait time greater than i32::MAX
-            if total_wait_time >= i32::MAX as i64 {
+            // Invalid matchings are marked by a total wait time greater than NO_EDGE_WEIGHT
+            if total_wait_time >= NO_EDGE_WEIGHT {
                 // We need to find out if a matching that covers all of the column_nodes nodes is possible
                 // If yes, we can use the Hungarian Algorithm (Kuhn-Munkres) to find the best
                 // (lowest wait time) matching
