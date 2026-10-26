@@ -94,11 +94,11 @@ Here is an example of a JSON string that represents a graph with two nodes and o
 
 *Unit tests* use rust's `cargo test` and can be run using `cargo test`. The tests are located in the `src/lib.rs` file.
 
-*Integration tests* use Python's `unittest` and can be run using `python -m unittest`. The tests are located in the `tests/test.py` file.
+*Integration tests* use Python's `unittest` and require the extension to be built and installed first (`pip install networkx .`). They can be run using `python -m unittest discover test`. The tests are located in the `test/test_eflips_schedule_rust.py` file.
 
 ## Documentation
 
-Documentation is inline accordint to Python (Docstring) and Rust (//!) conventions.
+Documentation is inline according to Python (Docstring) and Rust (//!) conventions.
 
 
 ## Development
@@ -111,8 +111,8 @@ We use [black](https://black.readthedocs.io/en/stable/) for python code formatti
 
 ## License
 
-This project is licensed under the AGPLv3 license - see the [LICENSE](LICENSE.md) file for details.
+This project is licensed under the AGPLv3 license - see the [AGPLv3.md](AGPLv3.md) file for details.
 
 ## Funding Notice
 
-This code was developed as part of the project [eBus2030+]([https://www.eflip.de/](https://www.now-gmbh.de/projektfinder/e-bus-2030/)) funded by the Federal German Ministry for Digital and Transport (BMDV) under grant number 03EMF0402.
+This code was developed as part of the project [eBus2030+](https://www.now-gmbh.de/projektfinder/e-bus-2030/) funded by the Federal German Ministry for Digital and Transport (BMDV) under grant number 03EMF0402.
