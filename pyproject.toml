@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "eflips-schedule-rust"
 description = "Vehicle Scheduling in Rust for eFLIPS."
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
