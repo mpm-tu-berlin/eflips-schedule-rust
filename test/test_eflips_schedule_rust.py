@@ -59,6 +59,21 @@ class TheTestCase(unittest.TestCase):
         # Print the number of connected components
         self.assertEqual(number_of_schedules, [142, 64, 21, 11, 9, 5, 5, 2, 1, 1, 1, 1])
 
+    def test_edge_delta_soc(self):
+        # Three trips of 0.3 each fit into one rotation, unless a connection consumes 0.5 itself
+        nodes = [{"id": i, "weight": [0.3, None]} for i in (1, 2, 3)]
+        edges = [
+            {"source": 1, "target": 2, "weight": 60},
+            {"source": 2, "target": 3, "weight": 60},
+        ]
+        result = solve(json.dumps([{"nodes": nodes, "edges": edges}]), max_delta_soc=1.0, max_duration=None)
+        self.assertEqual(sorted(result), [(1, 2), (2, 3)])
+
+        edges[1]["delta_soc"] = 0.5
+        result = solve(json.dumps([{"nodes": nodes, "edges": edges}]), max_delta_soc=1.0, max_duration=None)
+        self.assertNotIn((2, 3), result)
+        self.assertEqual(len(result), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
