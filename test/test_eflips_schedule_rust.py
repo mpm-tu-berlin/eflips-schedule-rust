@@ -60,7 +60,7 @@ class TheTestCase(unittest.TestCase):
         self.assertEqual(number_of_schedules, [142, 64, 21, 11, 9, 5, 5, 2, 1, 1, 1, 1])
 
     def test_edge_delta_soc(self):
-        # Three trips of 0.3 each fit into one rotation, unless a connection consumes 0.5 itself
+        """Three trips of 0.3 each fit into one rotation, unless a connection consumes 0.5 itself."""
         nodes = [{"id": i, "weight": [0.3, None]} for i in (1, 2, 3)]
         edges = [
             {"source": 1, "target": 2, "weight": 60},

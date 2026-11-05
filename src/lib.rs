@@ -68,7 +68,9 @@ struct JsonNode {
 struct JsonEdge {
     source: TripId,
     target: TripId,
+    /// The waiting time between the trips in seconds
     weight: Duration,
+    /// The energy the connection itself consumes; optional, so older inputs stay valid
     #[serde(default)]
     delta_soc: DeltaSoC,
 }
@@ -242,12 +244,12 @@ fn first_excess_index(
         if i > 0 {
             let prev = sorted_nodes[i - 1];
             let edge = bus_graph.graph.find_edge_undirected(prev, *node);
-            let ew = *bus_graph.graph.edge_weight(edge.unwrap().0).unwrap();
+            let edge_weight = *bus_graph.graph.edge_weight(edge.unwrap().0).unwrap();
             weight.duration = weight
                 .duration
-                .checked_add(ew.wait)
+                .checked_add(edge_weight.wait)
                 .expect("Duration overflow in first_excess_index");
-            weight.delta_soc += ew.delta_soc;
+            weight.delta_soc += edge_weight.delta_soc;
         }
         let nw = *bus_graph
             .graph
@@ -833,7 +835,7 @@ mod tests {
 
     /// Takes a solution (as a list of (TripId, TripId) pairs) as swell as the graph this is
     /// placed on, and checks if the sum of the node weights of the nodes in the connected set
-    /// is below the limit
+    /// (and of the weights of the edges between them) is below the limit
     /// Panics if the sum of the node weights is above the limit
     fn validate_sum_of_node_weights(
         solution: &Vec<(TripId, TripId)>,
@@ -862,7 +864,7 @@ mod tests {
         }
     }
 
-    /// Calculate the sum of weights of the nodes in a connected set
+    /// Calculate the sum of weights of the nodes in a connected set and of the edges between them
     fn node_weight_sum(connected_set: &Vec<NodeIndex>, bus_graph: &BusGraph) -> NodeWeight {
         let sorted_connected_set = sort_rotation_topologically(connected_set, bus_graph);
         let mut weight_sums = NodeWeight::default();
@@ -972,6 +974,7 @@ mod tests {
         {"source": 1, "target": 2, "weight": 60}, {"source": 2, "target": 3, "weight": 60, "delta_soc": 0.5}
     ]}]"#;
 
+    /// Edges without a delta_soc consume nothing: the chain is one rotation
     #[test]
     fn test_edge_delta_soc_defaults_to_zero() {
         let graphs = read_graph_from_string(CHAIN_WITHOUT_EDGE_SOC.to_string());
@@ -980,6 +983,7 @@ mod tests {
         assert_eq!(total_rotation_count(&trip_ids, &graphs[0]), 1);
     }
 
+    /// An edge's delta_soc counts into the rotation: the chain is split before that edge
     #[test]
     fn test_edge_delta_soc_splits_rotation() {
         let graphs = read_graph_from_string(CHAIN_WITH_EDGE_SOC.to_string());
