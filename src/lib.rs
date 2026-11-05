@@ -19,7 +19,16 @@ pub struct NodeWeight {
     delta_soc: DeltaSoC,
     duration: Duration,
 }
-pub type EdgeWeight = Duration;
+/// The weight of a connection between two trips
+#[derive(Serialize, Deserialize, Clone, Debug, Copy, Default)]
+pub struct EdgeWeight {
+    /// The waiting time between the trips in seconds. This is the cost minimized by the matching
+    /// and is counted into the rotation's duration.
+    wait: Duration,
+    /// The energy consumed by the connection itself (e.g. a deadhead to another stop), as a
+    /// fraction of the battery capacity. Counted into the rotation's delta_soc.
+    delta_soc: DeltaSoC,
+}
 
 /// Solve the vehicle scheduling problem
 /// This is the entry point (and only exposed function) for the Python module
@@ -53,13 +62,17 @@ struct JsonNode {
 }
 
 /// The list of edges is an inner level structure of the graph
-/// An edge connects two nodes and has a weight
+/// An edge connects two nodes and has a weight (the waiting time) and an optional delta_soc
 /// The source and target are the TripIds of the nodes
 #[derive(Serialize, Deserialize)]
 struct JsonEdge {
     source: TripId,
     target: TripId,
-    weight: EdgeWeight,
+    /// The waiting time between the trips in seconds
+    weight: Duration,
+    /// The energy the connection itself consumes; optional, so older inputs stay valid
+    #[serde(default)]
+    delta_soc: DeltaSoC,
 }
 
 /// The Json file is composed of the graph already split into a set of connected
@@ -131,7 +144,14 @@ fn json_graph_to_bus_graph(json_graphs: Vec<JsonGraph>) -> Vec<BusGraph> {
             let target = trip_id_node_id
                 .get(&edge.target)
                 .expect("Target node not found");
-            graph.add_edge(*source, *target, edge.weight);
+            graph.add_edge(
+                *source,
+                *target,
+                EdgeWeight {
+                    wait: edge.weight,
+                    delta_soc: edge.delta_soc,
+                },
+            );
         }
 
         // Calculate the topological order of the nodes
@@ -183,8 +203,8 @@ fn assemble_working_graph(
             .trip_id_node_id
             .get(&rotation_connection.1)
             .expect("Trip not found!");
-        working_graph.add_edge(node1, node2, 0);
-        working_graph.add_edge(node2, node1, 0);
+        working_graph.add_edge(node1, node2, EdgeWeight::default());
+        working_graph.add_edge(node2, node1, EdgeWeight::default());
     }
 
     working_graph
@@ -224,9 +244,12 @@ fn first_excess_index(
         if i > 0 {
             let prev = sorted_nodes[i - 1];
             let edge = bus_graph.graph.find_edge_undirected(prev, *node);
-            weight.duration = weight.duration.checked_add(
-                *bus_graph.graph.edge_weight(edge.unwrap().0).unwrap()
-            ).expect("Duration overflow in first_excess_index");
+            let edge_weight = *bus_graph.graph.edge_weight(edge.unwrap().0).unwrap();
+            weight.duration = weight
+                .duration
+                .checked_add(edge_weight.wait)
+                .expect("Duration overflow in first_excess_index");
+            weight.delta_soc += edge_weight.delta_soc;
         }
         let nw = *bus_graph
             .graph
@@ -484,7 +507,7 @@ fn soc_aware_rotation_plan_vec(
 }
 
 pub struct BipartiteGraph {
-    graph: Graph<(), EdgeWeight, Undirected>,
+    graph: Graph<(), Duration, Undirected>,
     top_node_id_trip_id: HashMap<NodeIndex, TripId>,
     bottom_node_id_trip_id: HashMap<NodeIndex, TripId>,
 }
@@ -494,7 +517,7 @@ pub struct BipartiteGraph {
 /// On this graph we can then solve the maximum matching problem
 fn to_bipartite(graph: &BusGraph) -> BipartiteGraph {
     let node_count = graph.graph.node_count();
-    let mut bipartite_graph: Graph<(), EdgeWeight, Undirected> = Graph::with_capacity(node_count * 2, graph.graph.edge_count());
+    let mut bipartite_graph: Graph<(), Duration, Undirected> = Graph::with_capacity(node_count * 2, graph.graph.edge_count());
 
     // Add nodes to the bipartite graph
     let mut top_node_id_bipartite_node_id: HashMap<NodeIndex, NodeIndex> = HashMap::with_capacity_and_hasher(node_count, Default::default());
@@ -517,7 +540,7 @@ fn to_bipartite(graph: &BusGraph) -> BipartiteGraph {
             let bipartite_bottom_idx = bottom_bipartite_node_id_node_id
                 .get(&edge.target())
                 .expect("Node not found!");
-            bipartite_graph.add_edge(*bipartite_top_idx, *bipartite_bottom_idx, *edge.weight());
+            bipartite_graph.add_edge(*bipartite_top_idx, *bipartite_bottom_idx, edge.weight().wait);
         }
     }
 
@@ -812,7 +835,7 @@ mod tests {
 
     /// Takes a solution (as a list of (TripId, TripId) pairs) as swell as the graph this is
     /// placed on, and checks if the sum of the node weights of the nodes in the connected set
-    /// is below the limit
+    /// (and of the weights of the edges between them) is below the limit
     /// Panics if the sum of the node weights is above the limit
     fn validate_sum_of_node_weights(
         solution: &Vec<(TripId, TripId)>,
@@ -841,7 +864,7 @@ mod tests {
         }
     }
 
-    /// Calculate the sum of weights of the nodes in a connected set
+    /// Calculate the sum of weights of the nodes in a connected set and of the edges between them
     fn node_weight_sum(connected_set: &Vec<NodeIndex>, bus_graph: &BusGraph) -> NodeWeight {
         let sorted_connected_set = sort_rotation_topologically(connected_set, bus_graph);
         let mut weight_sums = NodeWeight::default();
@@ -858,7 +881,8 @@ mod tests {
                 let next_node = sorted_connected_set[i + 1];
                 let edge = bus_graph.graph.find_edge_undirected(*node, next_node);
                 let edge_weight = bus_graph.graph.edge_weight(edge.unwrap().0).unwrap();
-                weight_sums.duration += *edge_weight;
+                weight_sums.duration += edge_weight.wait;
+                weight_sums.delta_soc += edge_weight.delta_soc;
             }
         }
         weight_sums
@@ -934,5 +958,39 @@ mod tests {
 
         let number_of_edges = [280, 103, 21, 12, 12, 14, 5, 4, 1, 1, 1, 1];
         assert_eq!(number_of_schedules, number_of_edges);
+    }
+
+    /// A chain of three trips whose node delta_socs (3 x 0.3) fit into one rotation
+    const CHAIN_WITHOUT_EDGE_SOC: &str = r#"[{"nodes": [
+        {"id": 1, "weight": [0.3, null]}, {"id": 2, "weight": [0.3, null]}, {"id": 3, "weight": [0.3, null]}
+    ], "edges": [
+        {"source": 1, "target": 2, "weight": 60}, {"source": 2, "target": 3, "weight": 60}
+    ]}]"#;
+
+    /// The same chain, but the second connection consumes 0.5 itself, so the chain does not fit
+    const CHAIN_WITH_EDGE_SOC: &str = r#"[{"nodes": [
+        {"id": 1, "weight": [0.3, null]}, {"id": 2, "weight": [0.3, null]}, {"id": 3, "weight": [0.3, null]}
+    ], "edges": [
+        {"source": 1, "target": 2, "weight": 60}, {"source": 2, "target": 3, "weight": 60, "delta_soc": 0.5}
+    ]}]"#;
+
+    /// Edges without a delta_soc consume nothing: the chain is one rotation
+    #[test]
+    fn test_edge_delta_soc_defaults_to_zero() {
+        let graphs = read_graph_from_string(CHAIN_WITHOUT_EDGE_SOC.to_string());
+        let trip_ids = soc_aware_rotation_plan(&graphs[0], 1.0.into(), None);
+        validate_sum_of_node_weights(&trip_ids, &graphs[0], 1.0.into(), None);
+        assert_eq!(total_rotation_count(&trip_ids, &graphs[0]), 1);
+    }
+
+    /// An edge's delta_soc counts into the rotation: the chain is split before that edge
+    #[test]
+    fn test_edge_delta_soc_splits_rotation() {
+        let graphs = read_graph_from_string(CHAIN_WITH_EDGE_SOC.to_string());
+        let trip_ids = soc_aware_rotation_plan(&graphs[0], 1.0.into(), None);
+        validate_sum_of_node_weights(&trip_ids, &graphs[0], 1.0.into(), None);
+        assert_eq!(total_rotation_count(&trip_ids, &graphs[0]), 2);
+        // The expensive connection must not be used
+        assert!(!trip_ids.contains(&(2, 3)));
     }
 }

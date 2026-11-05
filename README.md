@@ -27,7 +27,7 @@ The vehicle scheduling problem needs to be formulated as a Directed Acyclic Grap
 - Nodes are trips. Each trip has a weight tuple of two values:
     - `delta_soc`: the energy consumption of the trip as a fraction of battery capacity (float, 0 to 1). Can be `null` if not applicable.
     - `duration`: the duration of the trip in seconds (integer). Can be `null` if not applicable.
-- Edges are connections between trips. Each edge has a single weight that represents the waiting time between the trips in seconds (integer).
+- Edges are connections between trips. Each edge has a weight that represents the waiting time between the trips in seconds (integer). It may also have a `delta_soc` (float, default 0): the energy the connection itself consumes (e.g. a deadhead to another stop), counted into the rotation's `delta_soc`.
 - Connections that cannot be made should be represented as not existing, not by a very high weight.
 - The result is a list of edges, each representing a connection between two trips. By connecting all the nodes using *only* the edges in the result, a valid schedule is created.
 - The solver accepts optional limits (`max_delta_soc` and `max_duration`) to ensure that no rotation exceeds the given battery capacity or time budget. If no limits are provided, the solver does not split rotations.
@@ -62,7 +62,8 @@ The `data` parameter is a JSON string that contains the graph. It has the follow
     b. "edges" is a list of edges. Each edge is a dict with the following keys:
         - "source": the id of the source node.
         - "target": the id of the target node.
-        - "weight": an integer representing the waiting time between trips in seconds.
+        - "weight": an integer representing the waiting time between trips in seconds. It is the cost the matching minimizes and is counted into the rotation's duration.
+        - "delta_soc" (optional, default 0.0): a float, the energy consumption of the connection itself as a fraction of battery capacity. It is counted into the rotation's `delta_soc`.
 
 Here is an example of a JSON string that represents a graph with two nodes and one edge:
 
